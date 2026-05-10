@@ -121,8 +121,66 @@ Locked in so far:
   stream in a retry loop, and the breaker still records success/
   failure for the stream attempt as a whole. SSE end-to-end + the
   `partial=true` final event lands in a later phase.
+- **Cache is a TTL cache, not a write-through cache or anything
+  smarter.** A 5-minute TTL is the cheapest invalidation strategy
+  that's defensible end-to-end: no fanout on writes, no event bus to
+  invalidate by tenant or by model, no consistency story to debug.
+  The cost is staleness — for up to `ttlMs` after a price change or
+  a model upgrade, the gateway can keep serving the old answer.
+  Acceptable for the assignment's deterministic-replay use case
+  (same prompt / same tenant / same model_class within minutes); not
+  acceptable for cases that need "the answer the model would give
+  *right now*" (that's exactly why temperature > 0 opts out, and why
+  we never cache streaming).
+- **Tenant_id is in the cache key AND in the storage row.** Two
+  layers of isolation: the SHA-256 hash makes a key collision
+  across tenants cryptographically impossible; the composite UNIQUE
+  index `(tenant_id, cache_key)` turns a "leak across tenants" bug
+  into a Postgres constraint violation rather than a silent serve.
+  Every read also filters by `tenant_id` explicitly. The repository
+  test `does not return another tenant's row even with the same
+  cache_key` documents this as a contract, not an accident.
+- **Cache key uses the SELECTED provider/model, not the requested
+  one.** The router can pick anthropic for a request that originally
+  hit openai (because openai's breaker is OPEN). Caching under the
+  routed (provider, model) prevents serving openai's old answer for
+  an anthropic-routed request — the model would have produced
+  different output. After a successful call we re-key on the
+  provider that *actually* answered (which may differ from the
+  selected one if the failover loop rolled over) so future identical
+  requests routed the same way hit the cache.
+- **Cache lookup happens AFTER rate limit + budget gates.** The
+  assignment flow puts gates first, and there's a defensible reason:
+  rate-limiting is a property of the *caller*, not the response, so
+  a cache hit shouldn't let a tenant bypass it. Budget gating cached
+  hits is more debatable — cached responses are free to serve — but
+  staying inside the spec's flow keeps the contract obvious. On a
+  cache hit we set `cost_usd: 0` and skip the `usage_ledger` write,
+  so cached answers do not move the budget needle even though they
+  pass the gate.
+- **Cache invalidation tradeoff.** TTL is the only invalidation we
+  have. There is no per-tenant flush, no per-model purge, no
+  invalidate-on-price-change. Three concrete consequences this
+  trades for simplicity:
+    1. A pricing update in `provider_configs` doesn't invalidate
+       cached responses; replays continue to report the cached
+       (now stale) `usage` figures, but the cache hit reports
+       `cost_usd: 0` so no over- or under-billing is possible.
+    2. A `enabled = false` flip on a `provider_configs` row prevents
+       the router from selecting that provider going forward, but
+       cached responses for it remain valid for the rest of their
+       TTL. This is intentional — a hit is only ever served after
+       the router has independently picked the same provider/model
+       on the current request, so a disabled provider just stops
+       being picked and its cache rows time out naturally.
+    3. There is no cleanup sweeper. Stale rows accumulate until
+       the next request with a matching key replaces them. Storage
+       is bounded by the working set (cardinality of distinct
+       prompts × tenants × models), but production would add
+       `DELETE FROM cache_entries WHERE expires_at < now()` on a
+       cron and possibly a TTL extension.
 
-More decisions get added as cache, streaming, and observability land.
+More decisions get added as streaming and observability land.
 
 ## 4. Failure modes
 

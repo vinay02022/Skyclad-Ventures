@@ -97,6 +97,28 @@ curl -X POST http://localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer sk_test_tenantb_demo_key_DO_NOT_USE_IN_PROD" \
   -H "Content-Type: application/json" \
   -d '{"model_class":"cheap","messages":[{"role":"user","content":"hi"}]}'
+
+# Phase 7: cache demo. Fire the same deterministic request twice and watch
+# the second response return cached:true, cost_usd:0, routing.policy:"cache".
+# Cached responses do not write to usage_ledger.
+curl -s -X POST http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer sk_test_tenanta_demo_key_DO_NOT_USE_IN_PROD" \
+  -H "Content-Type: application/json" \
+  -d '{"model_class":"cheap","messages":[{"role":"user","content":"what is 2 + 2"}]}' | jq '{cached, cost_usd, routing}'
+curl -s -X POST http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer sk_test_tenanta_demo_key_DO_NOT_USE_IN_PROD" \
+  -H "Content-Type: application/json" \
+  -d '{"model_class":"cheap","messages":[{"role":"user","content":"what is 2 + 2"}]}' | jq '{cached, cost_usd, routing}'
+
+# Inspect the cache
+docker exec -it skyclad-postgres psql -U gateway -d gateway -c \
+  "SELECT tenant_id, substring(cache_key for 16) AS cache_key_prefix, expires_at FROM cache_entries;"
+
+# temperature > 0 opts out — replay never hits cache
+curl -s -X POST http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer sk_test_tenanta_demo_key_DO_NOT_USE_IN_PROD" \
+  -H "Content-Type: application/json" \
+  -d '{"model_class":"cheap","temperature":0.7,"messages":[{"role":"user","content":"hi"}]}' | jq '.cached'
 ```
 
 ### Failure injection knobs (mock providers only)
@@ -134,6 +156,7 @@ spurious failures on a fresh clone.
 | `tests/budget.test.ts` | `UsageLedgerRepository` round-trip + tenant isolation; chat endpoint writes a `usage_ledger` row on success; `402 TENANT_BUDGET_EXCEEDED` once the SUM crosses `monthly_budget_usd`; tenant_a still succeeds while tenant_b is over budget. |
 | `tests/ratelimit.test.ts` | `TokenBucket` unit (drain, refill, retryAfterMs, reconfigure clamp), `InMemoryRateLimiter` per-tenant isolation + reconfigure + `reset()`, integration: tenant_b at 10/min returns `429 TENANT_RATE_LIMITED` on burst 11, `Retry-After` header set, tenant_a unaffected. |
 | `tests/resilience.test.ts` | `ResilientAdapter` retries transient errors and succeeds on a later attempt; does NOT retry 4xx; exhausts retries and bubbles. `withTimeout` synthesizes a 504 retryable error. `CircuitBreaker` state machine: opens after threshold, transitions OPEN→HALF_OPEN after cooldown, lets exactly one probe through, closes on probe success or reopens on probe failure. `CircuitBreakerRegistry` as `ProviderHealthOracle` reports OPEN providers unhealthy and recovers after cooldown. End-to-end failover when one provider's circuit is OPEN. |
+| `tests/cache.test.ts` | `buildCacheKey` is deterministic, includes `tenant_id`, includes `provider`/`model`, ignores extra message fields, and returns 64-char sha256 hex. `isCacheable` rejects streaming and `temperature > 0`. `CacheRepository` set/get round-trips, isolates tenants on the same key, upserts on conflict, returns null for expired rows. End-to-end: same request hits cache on second call (`cached:true`, `cost_usd:0`, `routing.policy:"cache"`); cache hit writes no `usage_ledger` row; tenant_b doesn't see tenant_a's cache; streaming bypasses cache; `temperature > 0` bypasses cache; expired row causes a real provider call. |
 
 ## What is implemented so far
 
@@ -238,9 +261,36 @@ spurious failures on a fresh clone.
   `circuit breaker state change` on every transition, `provider call
   succeeded after retry` when retries actually saved a request
 
+**Phase 7 — deterministic-response cache**
+
+- New `cache_entries` table (uuid PK, tenant FK, jsonb body, expires_at)
+  with a composite UNIQUE on `(tenant_id, cache_key)` — cross-tenant
+  isolation enforced at the storage layer, not just at the key level
+- SHA-256 cache key over `(tenant_id, model_class, provider, model,
+  normalized messages, temperature, max_tokens)` — `tenant_id` is in
+  the hash AND in the WHERE clause; provider/model are in the hash so
+  a router fallback to a different upstream isn't served stale
+- Eligibility predicate `isCacheable(body)`: non-streaming AND
+  `temperature == 0` only. Anything else bypasses the cache for both
+  read and write
+- Cache lookup runs AFTER the routing decision. On hit: response
+  shape rebuilt with fresh `id` / `created_at` / `cached:true` /
+  `cost_usd:0` / `routing.policy:"cache"`, no provider call, no
+  `usage_ledger` write. On miss: failover loop runs, success is cached
+  keyed by the provider that actually answered (which may differ from
+  the originally selected one if a fallback ran)
+- Default 5-minute TTL via `DEFAULT_CACHE_CONFIG`; configurable through
+  `cacheConfig: { enabled, ttlMs }` on `buildApp`
+- `CacheRepository` get filters `expires_at > now()`, set is an upsert
+  on the composite unique index. No background sweeper for assignment
+  scope (stale rows are inert; production would add a periodic DELETE)
+- Cache write failures are non-fatal — they log loud but never break
+  the response; caching is an optimization, not part of the request's
+  correctness contract
+
 ## What is intentionally NOT yet implemented
 
-Response cache, SSE streaming end-to-end, `request_logs` writes,
+SSE streaming end-to-end, `request_logs` writes,
 per-tenant/provider/model metrics, `GET /v1/usage` summary. Each lands
 in its own phase.
 
@@ -289,21 +339,26 @@ src/
       circuit-breaker.ts     CircuitBreaker + CircuitBreakerRegistry (= ProviderHealthOracle)
       resilient-adapter.ts   ResilientAdapter wrapper + withTimeout helper
       factory.ts             buildResilientRegistry (wraps every adapter in the registry)
-    cache/                   (placeholder)
+    cache/
+      types.ts               CacheConfig, CacheKeyInput, CachedResponsePayload
+      defaults.ts            DEFAULT_CACHE_CONFIG (5-min TTL)
+      key.ts                 buildCacheKey (sha256 over tenant + routing + messages)
+      policy.ts              isCacheable (non-streaming + temperature == 0)
+      repository.ts          CacheRepository (Postgres-backed get/set)
     streaming/               (placeholder)
     observability/
       metrics.ts             prom-client registry
       routes.ts              GET /metrics
     persistence/             (placeholder)
 db/
-  schema.ts                  Drizzle table definitions (6 tables)
+  schema.ts                  Drizzle table definitions (7 tables)
   client.ts                  createDbHandle factory
   migrate.ts                 Programmatic migration runner
   seed.ts                    Idempotent seedDatabase + script entry
   seed-fixtures.ts           Shared seed/test constants (tenants, keys, prices)
   migrations/                drizzle-kit-generated SQL
 tests/
-  setup/db.ts                Test DB bootstrap (auto-create, migrate, seed) + truncateUsageLedger
+  setup/db.ts                Test DB bootstrap (auto-create, migrate, seed) + truncate helpers
   health.test.ts
   auth.test.ts
   tenants.test.ts
@@ -313,6 +368,7 @@ tests/
   budget.test.ts
   ratelimit.test.ts
   resilience.test.ts
+  cache.test.ts
 ```
 
 ## Useful one-liners

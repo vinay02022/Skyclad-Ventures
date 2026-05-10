@@ -1,9 +1,11 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 
 import { buildApp } from "../src/app.js";
 import { loadConfig } from "../src/config.js";
 import { createLogger } from "../src/logger.js";
+import { defaultIsRetryable } from "../src/modules/resilience/defaults.js";
+import { CircuitBreakerRegistry } from "../src/modules/resilience/circuit-breaker.js";
 import {
   TENANT_A_API_KEY,
   TENANT_B_API_KEY,
@@ -13,6 +15,19 @@ import { closeTestDb, getTestDb, isTestDbAvailable } from "./setup/db.js";
 const dbAvailable = await isTestDbAvailable();
 
 let app: FastifyInstance;
+let breakers: CircuitBreakerRegistry;
+
+// chat.test.ts is about routing + failover semantics, not about the
+// resilience knobs themselves. We disable retries (so existing failover
+// tests keep their original "first failure -> next provider" timing) and
+// hold a reference to the breaker registry so beforeEach can reset it
+// between tests. tests/resilience.test.ts is the suite that actually
+// exercises retry + timeout + breaker behaviour.
+const fastResilienceConfig = {
+  timeoutMs: 5_000,
+  retry: { maxAttempts: 1, delaysMs: [], jitterFactor: 0, isRetryable: defaultIsRetryable },
+  breaker: { failureThreshold: 9_999, failureWindowMs: 60_000, openCooldownMs: 1_000 },
+};
 
 beforeAll(async () => {
   if (!dbAvailable) return;
@@ -24,8 +39,20 @@ beforeAll(async () => {
   });
   const logger = createLogger(config);
   const handle = await getTestDb();
-  app = await buildApp({ config, logger, db: handle.db });
+  breakers = new CircuitBreakerRegistry(fastResilienceConfig.breaker);
+  app = await buildApp({
+    config,
+    logger,
+    db: handle.db,
+    resilience: fastResilienceConfig,
+    breakers,
+  });
   await app.ready();
+});
+
+beforeEach(() => {
+  if (!dbAvailable) return;
+  breakers.reset();
 });
 
 afterAll(async () => {

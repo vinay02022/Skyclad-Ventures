@@ -18,8 +18,11 @@ import { buildProviderRegistry } from "./modules/providers/factory.js";
 import { PricingRepository } from "./modules/providers/pricing.js";
 import type { ProviderRegistry } from "./modules/providers/registry.js";
 import { InMemoryRateLimiter, type RateLimiter } from "./modules/ratelimit/rate-limiter.js";
+import { CircuitBreakerRegistry } from "./modules/resilience/circuit-breaker.js";
+import { DEFAULT_RESILIENCE_CONFIG } from "./modules/resilience/defaults.js";
+import { buildResilientRegistry } from "./modules/resilience/factory.js";
+import type { ResilienceConfig, ResilienceLogger } from "./modules/resilience/types.js";
 import { CostOptimizedRoutingPolicy } from "./modules/routing/cost-optimized.js";
-import { AlwaysHealthyOracle } from "./modules/routing/health.js";
 import type { ProviderHealthOracle, RoutingPolicy } from "./modules/routing/types.js";
 import { TenantRepository } from "./modules/tenants/repository.js";
 import { registerTenantRoutes } from "./modules/tenants/routes.js";
@@ -43,6 +46,14 @@ export interface BuildAppOptions {
   rateLimiter?: RateLimiter;
   // Tests inject to read ledger writes back. Production constructs from db.
   usageLedger?: UsageLedgerRepository;
+  // Phase 6 resilience controls. Test-only escape hatches:
+  //   - resilience: shorten retries / disable timeout / loosen breaker for
+  //     suites whose subject isn't resilience itself.
+  //   - breakers:   inject a fresh registry tests can .reset() between cases.
+  // Production uses the defaults below (20s timeout, 3 attempts with
+  // 200/500ms backoff + jitter, breaker opens after 5 failures in 60s).
+  resilience?: ResilienceConfig;
+  breakers?: CircuitBreakerRegistry;
 }
 
 // App builder is separated from the listener so tests can use `app.inject(...)`
@@ -56,6 +67,8 @@ export async function buildApp({
   health,
   rateLimiter,
   usageLedger,
+  resilience,
+  breakers,
 }: BuildAppOptions): Promise<FastifyInstance> {
   const app = Fastify({
     // Pino's Logger is structurally compatible with FastifyBaseLogger at runtime;
@@ -100,13 +113,32 @@ export async function buildApp({
 
     // Phase 3: chat completions. Default to the mock-mode registry so a
     // fresh clone runs end-to-end without OpenAI/Anthropic API keys.
-    const providerRegistry = providers ?? buildProviderRegistry({ mode: "mock" });
+    const baseRegistry = providers ?? buildProviderRegistry({ mode: "mock" });
     const pricingRepo = new PricingRepository(db);
+    // Phase 6: every adapter in the registry is wrapped with a
+    // ResilientAdapter (timeout + retry + circuit breaker). Wrapping
+    // happens at the registry level so the chat handler / routing module
+    // stay unchanged. The CircuitBreakerRegistry doubles as the
+    // ProviderHealthOracle the router consumes — when a breaker is OPEN,
+    // the router skips the provider entirely.
+    const resilienceConfig = resilience ?? DEFAULT_RESILIENCE_CONFIG;
+    const resilienceLogger: ResilienceLogger = {
+      info: (obj, msg) => logger.info(obj, msg),
+      warn: (obj, msg) => logger.warn(obj, msg),
+    };
+    const breakerReg =
+      breakers ?? new CircuitBreakerRegistry(resilienceConfig.breaker, Date.now, resilienceLogger);
+    const providerRegistry = buildResilientRegistry({
+      inner: baseRegistry,
+      breakers: breakerReg,
+      config: resilienceConfig,
+      logger: resilienceLogger,
+    });
     // Phase 4: route by cost across the tenant allowlist + provider health.
-    // AlwaysHealthyOracle is the default until a circuit breaker lands; the
-    // routing seam stays the same.
+    // The breaker registry IS the health oracle; OPEN providers get filtered
+    // out by the router with no further wiring.
     const routingPolicy = policy ?? new CostOptimizedRoutingPolicy();
-    const healthOracle = health ?? new AlwaysHealthyOracle();
+    const healthOracle = health ?? breakerReg;
     // Phase 5: per-tenant rate limit (in-memory) + budget ledger (Postgres).
     // Both are isolated per tenant_id; a tenant exhausting either rejects
     // only that tenant.

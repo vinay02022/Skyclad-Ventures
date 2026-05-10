@@ -169,6 +169,104 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
   "http://localhost:8080/admin/tenants/00000000-0000-0000-0000-00000000000a/usage?from=2026-05-01&to=2026-05-31" | jq .
 ```
 
+### Phase 11 — Evaluator walkthrough (8 steps)
+
+Same 8-step demo a reviewer is likely to run, but driven by the
+**eval-only admin helpers** instead of per-request `x-skyclad-fail`
+headers. The whole script is copy-pasteable. Set the admin token first
+(any non-empty string works locally):
+
+```bash
+export ADMIN_TOKEN="local-dev-admin-token"   # restart the server after setting
+ADMIN="Authorization: Bearer $ADMIN_TOKEN"
+A="Authorization: Bearer sk_test_tenanta_demo_key_DO_NOT_USE_IN_PROD"
+B="Authorization: Bearer sk_test_tenantb_demo_key_DO_NOT_USE_IN_PROD"
+JSON="Content-Type: application/json"
+URL=http://localhost:8080
+```
+
+```bash
+# 1. Normal tenant request (router picks the cheapest allowed provider).
+curl -s -X POST $URL/v1/chat/completions -H "$A" -H "$JSON" \
+  -d '{"model_class":"cheap","messages":[{"role":"user","content":"hello"}]}' | jq '{provider, model, cost_usd, routing}'
+
+# 2. Streaming request (text/event-stream; one `token` per chunk + final `done`).
+curl -N -X POST $URL/v1/chat/completions -H "$A" -H "$JSON" \
+  -d '{"model_class":"cheap","stream":true,"messages":[{"role":"user","content":"tell me a joke"}]}'
+
+# 3. Force OpenAI failure (persistent until cleared — no more headers needed).
+curl -s -X POST $URL/admin/mock-providers/openai/failure-mode -H "$ADMIN" -H "$JSON" \
+  -d '{"mode":"fail_5xx"}' | jq .
+
+# 4. Show Anthropic fallback. tenant_a allows both providers, so the router
+#    skips the broken openai and answers with anthropic. routing.fallback_used = true.
+curl -s -X POST $URL/v1/chat/completions -H "$A" -H "$JSON" \
+  -d '{"model_class":"cheap","messages":[{"role":"user","content":"now answer me"}]}' \
+  | jq '{provider, routing}'
+
+#    Reset openai before the next steps so it's not a confounder.
+curl -s -X POST $URL/admin/mock-providers/openai/failure-mode -H "$ADMIN" -H "$JSON" \
+  -d '{"mode":"normal"}' > /dev/null
+
+# 5. Exhaust Tenant A budget (drop its cap to nearly $0; next call returns 402).
+curl -s -X POST $URL/admin/tenants/00000000-0000-0000-0000-00000000000a/set-budget \
+  -H "$ADMIN" -H "$JSON" -d '{"monthly_budget_usd":0.0001}' | jq .
+curl -s -X POST $URL/v1/chat/completions -H "$A" -H "$JSON" \
+  -d '{"model_class":"cheap","messages":[{"role":"user","content":"hi"}]}' | jq .
+
+# 6. Show Tenant B still works (proves per-tenant isolation — A's failure
+#    does not affect B). tenant_b's $2 budget is untouched.
+curl -s -X POST $URL/v1/chat/completions -H "$B" -H "$JSON" \
+  -d '{"model_class":"cheap","messages":[{"role":"user","content":"hi"}]}' | jq '{provider, cost_usd}'
+
+#    Restore tenant_a's seeded budget for the next run.
+curl -s -X POST $URL/admin/tenants/00000000-0000-0000-0000-00000000000a/set-budget \
+  -H "$ADMIN" -H "$JSON" -d '{"monthly_budget_usd":10}' > /dev/null
+#    (And/or wipe the ledger entirely.)
+curl -s -X POST $URL/admin/tenants/00000000-0000-0000-0000-00000000000a/reset-usage \
+  -H "$ADMIN" | jq .
+
+# 7. Query /metrics — Prometheus exposition. Filter to gateway_* series.
+curl -s $URL/metrics | grep '^gateway_' | head -30
+
+# 8. Query tenant usage summary (per-provider, per-model, per-token-type).
+curl -s -H "$ADMIN" \
+  "$URL/admin/tenants/00000000-0000-0000-0000-00000000000a/usage?from=2026-05-01&to=2026-05-31" | jq .
+```
+
+### Eval helper endpoints (Phase 11)
+
+Three endpoints exist for **local evaluation only**. They share the
+same `ADMIN_TOKEN` Bearer gate as `/admin/tenants/:id/usage` and every
+response carries `x-skyclad-eval-only: true` so it's obvious in logs
+when one was called. They are **not** production admin APIs — see
+DESIGN.md for the gaps (no per-operator identity, no audit trail, no
+rate-limit on the admin surface).
+
+| Method + path | Body | Effect |
+|---|---|---|
+| `POST /admin/mock-providers/:provider/failure-mode` | `{"mode":"normal"}` | Clears any persistent failure on that mock. |
+| `POST /admin/mock-providers/:provider/failure-mode` | `{"mode":"fail_5xx"}` | Every subsequent call to that mock throws ProviderError(500, retryable). |
+| `POST /admin/mock-providers/:provider/failure-mode` | `{"mode":"timeout"}` | Mock sleeps 60s; the resilient wrapper races the configured `timeoutMs` and synthesizes a 504. |
+| `POST /admin/mock-providers/:provider/failure-mode` | `{"mode":"stream_drop_before_first_token"}` | Streaming calls throw before any chunk. Safe to fail over. |
+| `POST /admin/mock-providers/:provider/failure-mode` | `{"mode":"stream_drop_after_chunks","chunks":2}` | Streaming calls emit N chunks, then throw. Not retried — produces a `partial:true` SSE error event. |
+| `POST /admin/tenants/:tenantId/reset-usage` | _(none)_ | Deletes every `usage_ledger` row for that tenant. Returns `{rows_deleted}`. |
+| `POST /admin/tenants/:tenantId/set-budget` | `{"monthly_budget_usd":25.0}` | Updates `tenants.monthly_budget_usd`. The auth hook re-reads the tenant on every call, so the change applies on the very next request. |
+
+Notes:
+
+- `:provider` is restricted to the registered mock names: `openai`,
+  `anthropic`. Anything else returns 400.
+- `x-skyclad-fail` headers (per-request injection) still take
+  precedence over the persistent mode set by these endpoints. The
+  store is the "until I clear it" mode for scenario walkthroughs;
+  headers are the "just this one request" mode.
+- Settings are **process-local** and clear on restart by design — we
+  don't want a debug knob persisting through a deploy.
+- In live mode (`MOCK_PROVIDERS=false`) the failure-mode endpoint
+  still accepts the call but the real adapters never read the store,
+  so the setting has no effect. Demonstrate failures with the mocks.
+
 ### Running with real OpenAI / Anthropic providers (Phase 10)
 
 Mock mode (the default) is the right choice for everything except a
@@ -263,6 +361,7 @@ spurious failures on a fresh clone.
 | `tests/streaming.test.ts` | `formatSSEEvent` emits the right wire format for token/done/error. End-to-end SSE: `text/event-stream` headers; multiple `token` events followed by exactly one `done`; ledger and `request_logs` rows written on success (`streaming=true`, `status=success`, `cache_hit=false`); cache fully bypassed for streaming. Failover before first byte succeeds silently (anthropic answers when openai pre-drops). After-N-tokens drop emits exactly one `error` event with `partial:true` and NO `done` after it; partial response is logged with `status=partial_failed` and tenant is billed for what was actually sent. All-providers-pre-drop emits one `error` with `partial:false` and logs `status=all_providers_failed`. Tenant isolation under concurrent streams. |
 | `tests/observability.test.ts` | Successful non-streaming request writes a complete `request_logs` row (`tenant_id`, `provider`, `model`, `status=success`, `latency_ms`, `input_tokens`, `output_tokens`, `cost_usd`, `cache_hit=false`, `streaming=false`). Forced provider failure writes a row with `status=all_providers_failed` and `error_type` populated, AND increments `gateway_errors_total`. The seven gateway-level Prometheus series are present in the registry serialization, with `tenant_id` / `provider` / `model` / `status` labels populated and tokens partitioned by `token_type`. |
 | `tests/admin-usage.test.ts` | `GET /admin/tenants/:tenantId/usage` rejects no-token (401) and wrong-token (401), validates date params (400 on malformed or `from > to`), returns zero totals (not 404) for empty ranges, aggregates `usage_ledger` rows correctly into `total_*` / `by_provider` / `by_model`, and is fully tenant-isolated (tenant_b's response never carries tenant_a's numbers). |
+| `tests/admin-eval-helpers.test.ts` | Phase-11 eval-only admin endpoints. Auth gate rejects no-token / wrong-token (401) on all three. `POST /admin/mock-providers/:provider/failure-mode` toggles persistent mock behaviour across requests (baseline 200, force `fail_5xx` → 5xx, clear → 200 again), forced 5xx on openai falls over to anthropic for tenant_a (`routing.fallback_used:true`), `stream_drop_after_chunks` produces a partial `error` SSE event with `partial:true` and writes `request_logs.status='partial_failed'`; rejects unknown provider names (400) and missing `chunks` (400). `POST /admin/tenants/:id/reset-usage` deletes every ledger row for one tenant (returns `rows_deleted`), is a no-op on empty ledgers, and never touches other tenants. `POST /admin/tenants/:id/set-budget` lowers the cap and the next request returns `402 TENANT_BUDGET_EXCEEDED`; raising the cap unblocks the same request; 404 on unknown tenant; 400 on negative budget. |
 | `tests/providers-real.test.ts` | Pure-function coverage for the SSE parser (chunk-boundary mid-line, `\r\n` endings, comment lines, multi-line `data:`, EOF flush) and `mapHttpStatusToProviderError` (400/401/422 → not retryable, 429 → retryable, 5xx → retryable, transport AbortError → 504, other transport → 503). `OpenAIProvider`: rejects empty key; `resolveDefaultModel` matches the seeded rows; `complete()` sends the right URL/headers/body and parses the response; missing `usage` falls back to the chars/4 estimator; all four error classes map correctly; `stream()` opts in via `stream_options.include_usage` and yields delta + done with upstream-reported usage; pre-stream 5xx maps to retryable. Same coverage for `AnthropicProvider` plus `hoistSystemMessages` (system role extracted to top-level), multi-text-block concatenation, and the named-event SSE shape (`message_start`, `content_block_delta`, `message_delta`, `message_stop`). |
 | `tests/factory.test.ts` | `mode: "mock"` wires both mocks; `mode: "live"` + both keys wires both real adapters; `mode: "live"` + one missing key falls back to mock for that provider only and emits exactly one warning; both keys missing emits two warnings; `fetchImpl` and `baseUrl` overrides reach the real adapter for network-free tests. |
 
@@ -488,6 +587,40 @@ spurious failures on a fresh clone.
   falls back to mock per-provider with a logged warning. Tests
   default to mock mode unconditionally; the test suite never makes
   a real network call.
+
+**Phase 11 — evaluator-friendly admin helpers**
+
+- `MockFailureStore` — a process-local map consulted by every mock
+  call. `MockProviderBase.resolveFailure` reads in priority order:
+  per-request `x-skyclad-fail` header (wins) → store entry → none.
+  Means "OpenAI is broken" can be set with one curl and held until
+  cleared, instead of remembering to attach a header to every demo
+  request.
+- `POST /admin/mock-providers/:provider/failure-mode` (Bearer
+  ADMIN_TOKEN). Discriminated-union body: `normal`, `fail_5xx`,
+  `timeout`, `stream_drop_before_first_token`,
+  `stream_drop_after_chunks` (with required `chunks`). Translates
+  to the existing `FailureInjection` shape and writes it to the
+  store. Restricted to known mock provider names (`openai`,
+  `anthropic`); 400 on anything else.
+- `POST /admin/tenants/:tenantId/reset-usage` — `DELETE FROM
+  usage_ledger WHERE tenant_id = $1`, returns `rows_deleted`. Used
+  to demo the budget-exhausted-then-recovered flow without waiting
+  for monthly rollover or dropping into psql.
+- `POST /admin/tenants/:tenantId/set-budget` (`{monthly_budget_usd}`)
+  — `UPDATE tenants SET monthly_budget_usd = ...`. The auth hook
+  re-reads the tenant on every request, so the change applies on the
+  very next call. Validates: non-negative + finite; 404 on unknown
+  tenant.
+- All three endpoints share the existing ADMIN_TOKEN Bearer hook (so
+  `unset ADMIN_TOKEN` = endpoints not registered = 404 — fail closed
+  on misconfigured deploys) and stamp `x-skyclad-eval-only: true` on
+  every response so post-hoc log scans can spot when they were used.
+- The admin plugin is now wrapped in `app.register(...)` so the
+  Bearer hook is encapsulated to `/admin/*` only — without that
+  wrapper the hook would also reject normal `/v1/chat/completions`
+  traffic. (The original Phase-9 code happened to work because no
+  test exercised both surfaces in one process; Phase 11's tests do.)
 
 ## What is intentionally NOT yet implemented
 

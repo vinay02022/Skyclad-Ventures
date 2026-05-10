@@ -355,6 +355,51 @@ Locked in so far:
   approximation the cost-routing math uses pre-call, so worst-
   case the billed cost matches what the router thought the
   request would cost.
+- **Eval-only admin helpers are explicitly second-class.** Phase 11
+  adds `POST /admin/mock-providers/:provider/failure-mode`,
+  `POST /admin/tenants/:id/reset-usage`, and
+  `POST /admin/tenants/:id/set-budget`. These exist because the
+  evaluator's job is "spin it up locally, simulate provider
+  failures, exhaust budget, watch it recover" — and the alternative
+  (re-attaching `x-skyclad-fail` headers to every request, dropping
+  into psql to wipe `usage_ledger`, waiting for monthly budget
+  rollover) is friction that hides the architecture behind tooling
+  the assignment isn't testing. They share the existing
+  `ADMIN_TOKEN` Bearer hook, every response carries
+  `x-skyclad-eval-only: true`, and the failure store is process-
+  local memory that clears on restart by design — we never want a
+  debug knob persisting through a deploy. None of this is
+  production-shaped: real billing-affecting endpoints need
+  per-operator identity (not a shared secret), an audit-log row per
+  call, an approval workflow on `set-budget`, rate-limit on the
+  admin surface itself, and almost always a separate segregated
+  admin service. We make none of those investments here. The same
+  failure-mode surface in production would instead be a
+  feature-flag system — Statsig, LaunchDarkly, or a homebrew table
+  — that drives a percentage rollout and emits an audit event per
+  toggle.
+- **Per-request `x-skyclad-fail` header still wins over the
+  persistent store.** `MockProviderBase.resolveFailure` reads the
+  header first and only falls back to the store if absent. This
+  preserves the surgical, single-request failure injection the
+  existing test suite relies on while the store handles the
+  scenario walkthrough. They cost nothing to support together — one
+  is "this single call fails", the other is "every call until I
+  clear it" — and conflating them would have broken the existing
+  failover tests which rely on `x-skyclad-fail-provider: openai`
+  while leaving anthropic alone.
+- **Admin plugin is wrapped in `app.register(...)` — encapsulation
+  matters.** The Phase-9 code added the admin Bearer-token
+  `onRequest` hook to the app instance directly. That happened to
+  work because no test exercised both `/admin/*` and
+  `/v1/chat/completions` in the same process. The Phase-11 tests
+  do, and the hook would have rejected normal tenant chat traffic
+  with 401. The fix is one line: wrap `registerAdminRoutes` in a
+  `app.register(async (scope) => { ... })` so Fastify creates a
+  child encapsulation context and the hook only runs on routes
+  registered inside it. This is the pattern every Fastify plugin
+  should use; this code base now does.
+
 - **Streaming opts in to upstream usage, on purpose.** OpenAI
   doesn't include a usage block in streamed responses unless
   the request body sets `stream_options.include_usage: true`.

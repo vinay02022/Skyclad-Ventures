@@ -38,7 +38,45 @@ curl -H "Authorization: Bearer sk_test_tenanta_demo_key_DO_NOT_USE_IN_PROD" \
 # tenant_b has a smaller budget and only OpenAI in its allowlist
 curl -H "Authorization: Bearer sk_test_tenantb_demo_key_DO_NOT_USE_IN_PROD" \
   http://localhost:8080/v1/me
+
+# Chat completion (non-streaming). Default provider in Phase 3 is openai (mock).
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer sk_test_tenanta_demo_key_DO_NOT_USE_IN_PROD" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model_class": "cheap",
+    "messages": [{"role":"user","content":"hello there"}]
+  }'
+
+# Force the upstream to fail with a 5xx for failure-injection testing
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer sk_test_tenanta_demo_key_DO_NOT_USE_IN_PROD" \
+  -H "Content-Type: application/json" \
+  -H "x-skyclad-fail: 5xx" \
+  -d '{ "model_class": "cheap", "messages": [{"role":"user","content":"hi"}] }'
+
+# Pin the anthropic mock and ask for a premium model
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer sk_test_tenanta_demo_key_DO_NOT_USE_IN_PROD" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model_class": "premium",
+    "provider": "anthropic",
+    "messages": [{"role":"user","content":"explain SSL termination"}]
+  }'
 ```
+
+### Failure injection knobs (mock providers only)
+
+| Header | Value | Effect |
+|---|---|---|
+| `x-skyclad-fail` | `5xx` | Adapter throws ProviderError(500, retryable). Endpoint returns 502. |
+| `x-skyclad-fail` | `rate-limit` | Adapter throws ProviderError(429, retryable). Endpoint returns 502. |
+| `x-skyclad-fail` | `timeout` | Adapter sleeps 60s. Phase 5 will race this against a timeout. |
+| `x-skyclad-fail` | `pre-stream-drop` | `stream()` throws before any chunk. Safe to failover. |
+| `x-skyclad-fail` | `stream-drop` | `stream()` emits N chunks, then throws. Not retryable. |
+| `x-skyclad-fail-after` | integer | For `stream-drop`: number of chunks before the failure. |
+| `x-skyclad-fail-delay` | integer (ms) | Optional artificial latency before the (failing) call. |
 
 ## Tests
 
@@ -56,6 +94,8 @@ spurious failures on a fresh clone.
 | `tests/health.test.ts` | `/health` returns ok, request id propagation, `/metrics` returns Prometheus exposition format. |
 | `tests/auth.test.ts` | Missing / unknown / valid bearer tokens, two seeded tenants, `/health` and `/metrics` are public. |
 | `tests/tenants.test.ts` | `TenantRepository` lookup by hashed API key, budget config read, allowlist read, tenant-A vs tenant-B isolation. |
+| `tests/providers.test.ts` | Mock provider adapters: name, model resolution, `complete`, `stream`, all five failure modes, token estimation, health. |
+| `tests/chat.test.ts` | `POST /v1/chat/completions` end-to-end: auth, validation (missing fields, empty messages), normalized response shape, no provider-specific field leakage, provider override, model_class resolution, forced 5xx via header, 501 for stream:true, both seeded tenants. |
 
 ## What is implemented so far
 
@@ -81,13 +121,25 @@ spurious failures on a fresh clone.
 - Fastify `onRequest` auth hook protecting `/v1/*` (public paths still public)
 - `TenantRepository` with `findByApiKey`, `getBudgetConfig`, `getAllowlist`
 - `GET /v1/me` identity / smoke-test endpoint
-- Test infrastructure: separate `gateway_test` DB, auto-create on first run,
-  truncate-and-reseed before each suite
+
+**Phase 3 — unified chat API + provider adapter abstraction**
+
+- `POST /v1/chat/completions` (non-streaming) with Zod-validated request body
+- `ProviderAdapter` interface: `complete`, `stream`, `estimateTokens`, `health`
+- Two mock provider adapters registered as `openai` and `anthropic`
+- `MockProviderBase` with failure injection: `5xx`, `rate-limit`, `timeout`,
+  `stream-drop` (after N chunks), `pre-stream-drop`
+- Failure injection via headers: `x-skyclad-fail`, `x-skyclad-fail-after`,
+  `x-skyclad-fail-delay`
+- `ProviderRegistry` + `buildProviderRegistry({ mode })` factory
+- `PricingRepository` reads `provider_configs` and computes `cost_usd` for
+  every response; in-process cache for the static price table
+- Normalized `UnifiedChatResponse` — no provider-specific fields leak
 
 ## What is intentionally NOT yet implemented
 
-Providers (OpenAI / Anthropic / mock), routing, retries, circuit breaker,
-cache, SSE streaming, request logging, usage ledger writes, budget
+Routing (cost-based selection across allowlist), retries, circuit breaker,
+cache, SSE streaming end-to-end, request logging, usage ledger writes, budget
 enforcement, rate limiting. Each lands in its own phase.
 
 ## Repo layout
@@ -106,7 +158,20 @@ src/
       types.ts               AuthenticatedTenant interface
       repository.ts          findByApiKey, getBudgetConfig, getAllowlist
       routes.ts              GET /v1/me
-    providers/               (placeholder)
+    chat/
+      validation.ts          Zod schema for POST /v1/chat/completions body
+      routes.ts              POST /v1/chat/completions handler
+    providers/
+      types.ts               ChatMessage, UnifiedChat*, Provider*, FailureInjection
+      errors.ts              ProviderError class
+      tokens.ts              Token estimator (chars / 4 heuristic)
+      failure-injection.ts   Header parser for x-skyclad-fail*
+      mock-base.ts           Shared mock behaviour (failures, streaming)
+      mock-openai.ts         MockOpenAIProvider (registered as "openai")
+      mock-anthropic.ts      MockAnthropicProvider (registered as "anthropic")
+      registry.ts            ProviderRegistry (in-memory map by name)
+      factory.ts             buildProviderRegistry({ mode })
+      pricing.ts             PricingRepository + calculateCost
     routing/                 (placeholder)
     resilience/              (placeholder)
     cache/                   (placeholder)

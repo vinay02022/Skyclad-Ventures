@@ -179,8 +179,58 @@ Locked in so far:
        prompts × tenants × models), but production would add
        `DELETE FROM cache_entries WHERE expires_at < now()` on a
        cron and possibly a TTL extension.
+- **Streaming has one rule and the rest follows from it: the first
+  byte commits the response.** Before the first `token` event is
+  written to the socket, the streaming handler is identical to the
+  non-streaming failover loop — a retryable upstream error rolls
+  over to the next candidate and the client never observes the
+  failure. Once the first `token` is on the wire, the gateway has
+  irrevocably told the client "the answer is coming from provider
+  X". Retrying or failing over after that would mean the client
+  receives output from two different providers concatenated as if
+  it were one response, which is worse than any error we could
+  send. So: emit one `error` event with `partial:true`, end the
+  stream, log it, and stop. This rule lives in exactly one place
+  (the `firstByteSent` flag in `streaming/handler.ts`); it is not
+  a policy a future caller can override.
+- **Streaming responses are NEVER cached.** The cache stores a
+  fully assembled response; replaying it as SSE would mean
+  re-chunking and re-emitting `done`, plus deciding what to do
+  about partially cached rows. That is a separate piece of work,
+  and the latency reason for streaming (tokens visible as they are
+  generated) is destroyed if the whole response is shipped at once
+  anyway. `isCacheable(body)` returns false for `stream:true`, and
+  the streaming branch in `chat/routes.ts` short-circuits before
+  the cache lookup runs at all.
+- **Partial responses are billed.** The upstream did real token-
+  generation work for every byte the client received. Walking away
+  without writing a `usage_ledger` row would be the gateway eating
+  the cost. The `partial_failed` path bills the tenant for the
+  output tokens accumulated from streamed deltas (using the same
+  `chars / 4` heuristic as estimate-time). The alternative — only
+  billing on clean completion — would let any caller minimize
+  spend by hanging up mid-stream, which is a predictable abuse
+  vector worth designing out from day one.
+- **`reply.hijack()` ordering is load-bearing.** Once Fastify
+  hands us the raw socket, the route handler's return value no
+  longer unblocks the response — `reply.raw.end()` does. So the
+  streaming handler writes the terminal SSE event (`done` or
+  `error`), then awaits all DB writes (`usage_ledger`,
+  `request_logs`), and only then calls `reply.raw.end()`. End-
+  then-write would race anyone (test or operator) querying the DB
+  right after the response. The ordering is documented at the
+  call site so the next maintainer doesn't innocently "tidy up"
+  the flow and reintroduce the race.
+- **Single `request_logs` row per streaming request.** Phase 8
+  introduces durable per-request logging only for the streaming
+  path. Non-streaming paths still log via Pino (the structured
+  `chat completion ok` line is searchable in the JSON log
+  pipeline). Full `request_logs` coverage for non-streaming
+  arrives alongside the per-tenant Prometheus histograms — the
+  same insertion API serves both, so shipping the API now and the
+  writers later costs nothing.
 
-More decisions get added as streaming and observability land.
+More decisions get added as observability lands.
 
 ## 4. Failure modes
 

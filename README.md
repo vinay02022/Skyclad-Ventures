@@ -119,6 +119,38 @@ curl -s -X POST http://localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer sk_test_tenanta_demo_key_DO_NOT_USE_IN_PROD" \
   -H "Content-Type: application/json" \
   -d '{"model_class":"cheap","temperature":0.7,"messages":[{"role":"user","content":"hi"}]}' | jq '.cached'
+
+# Phase 8: SSE streaming. Returns text/event-stream; client sees one
+# `data: {"type":"token","content":"..."}` line per chunk, finishing with
+# `data: {"type":"done"}`. Use `curl -N` to disable buffering.
+curl -N -X POST http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer sk_test_tenanta_demo_key_DO_NOT_USE_IN_PROD" \
+  -H "Content-Type: application/json" \
+  -d '{"model_class":"cheap","stream":true,"messages":[{"role":"user","content":"tell me a joke"}]}'
+
+# Streaming failover: openai pre-stream-drops, anthropic answers. The client
+# sees only anthropic's tokens followed by `done` -- no error event.
+curl -N -X POST http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer sk_test_tenanta_demo_key_DO_NOT_USE_IN_PROD" \
+  -H "Content-Type: application/json" \
+  -H "x-skyclad-fail: pre-stream-drop" \
+  -H "x-skyclad-fail-provider: openai" \
+  -d '{"model_class":"cheap","stream":true,"messages":[{"role":"user","content":"hi"}]}'
+
+# Partial-stream failure: openai sends 2 tokens then drops. Client sees those
+# 2 tokens followed by ONE error event with `partial:true`. NEVER fails over
+# (the client is already committed to the partial response).
+curl -N -X POST http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer sk_test_tenanta_demo_key_DO_NOT_USE_IN_PROD" \
+  -H "Content-Type: application/json" \
+  -H "x-skyclad-fail: stream-drop" \
+  -H "x-skyclad-fail-after: 2" \
+  -H "x-skyclad-fail-provider: openai" \
+  -d '{"model_class":"cheap","stream":true,"messages":[{"role":"user","content":"hi"}]}'
+
+# Inspect what got logged for the partial failure
+docker exec -it skyclad-postgres psql -U gateway -d gateway -c \
+  "SELECT request_id, status, streaming, provider, output_tokens, error_type FROM request_logs ORDER BY created_at DESC LIMIT 5;"
 ```
 
 ### Failure injection knobs (mock providers only)
@@ -157,6 +189,7 @@ spurious failures on a fresh clone.
 | `tests/ratelimit.test.ts` | `TokenBucket` unit (drain, refill, retryAfterMs, reconfigure clamp), `InMemoryRateLimiter` per-tenant isolation + reconfigure + `reset()`, integration: tenant_b at 10/min returns `429 TENANT_RATE_LIMITED` on burst 11, `Retry-After` header set, tenant_a unaffected. |
 | `tests/resilience.test.ts` | `ResilientAdapter` retries transient errors and succeeds on a later attempt; does NOT retry 4xx; exhausts retries and bubbles. `withTimeout` synthesizes a 504 retryable error. `CircuitBreaker` state machine: opens after threshold, transitions OPEN→HALF_OPEN after cooldown, lets exactly one probe through, closes on probe success or reopens on probe failure. `CircuitBreakerRegistry` as `ProviderHealthOracle` reports OPEN providers unhealthy and recovers after cooldown. End-to-end failover when one provider's circuit is OPEN. |
 | `tests/cache.test.ts` | `buildCacheKey` is deterministic, includes `tenant_id`, includes `provider`/`model`, ignores extra message fields, and returns 64-char sha256 hex. `isCacheable` rejects streaming and `temperature > 0`. `CacheRepository` set/get round-trips, isolates tenants on the same key, upserts on conflict, returns null for expired rows. End-to-end: same request hits cache on second call (`cached:true`, `cost_usd:0`, `routing.policy:"cache"`); cache hit writes no `usage_ledger` row; tenant_b doesn't see tenant_a's cache; streaming bypasses cache; `temperature > 0` bypasses cache; expired row causes a real provider call. |
+| `tests/streaming.test.ts` | `formatSSEEvent` emits the right wire format for token/done/error. End-to-end SSE: `text/event-stream` headers; multiple `token` events followed by exactly one `done`; ledger and `request_logs` rows written on success (`streaming=true`, `status=success`, `cache_hit=false`); cache fully bypassed for streaming. Failover before first byte succeeds silently (anthropic answers when openai pre-drops). After-N-tokens drop emits exactly one `error` event with `partial:true` and NO `done` after it; partial response is logged with `status=partial_failed` and tenant is billed for what was actually sent. All-providers-pre-drop emits one `error` with `partial:false` and logs `status=all_providers_failed`. Tenant isolation under concurrent streams. |
 
 ## What is implemented so far
 
@@ -288,11 +321,41 @@ spurious failures on a fresh clone.
   the response; caching is an optimization, not part of the request's
   correctness contract
 
+**Phase 8 — SSE streaming + partial-failure handling**
+
+- `POST /v1/chat/completions` with `stream: true` now returns
+  `text/event-stream` instead of 501. Same gates (rate limit, budget)
+  and same routing decision; only the response framing changes
+- Wire format: one `data: {...}\n\n` line per event. Three event
+  shapes: `{type:"token",content:"..."}`, `{type:"done"}`,
+  `{type:"error",message:"...",partial:true|false}`
+- **First-byte commitment** is the load-bearing rule. Before any
+  `token` event reaches the client: a retryable upstream error is
+  treated as a normal failover trigger; the chat handler walks the
+  candidate list and the client never observes the failure. After
+  the first `token`: NEVER retry, NEVER fall over. Emit one `error`
+  event with `partial:true`, end the stream cleanly, log the partial
+  outcome
+- Cache is bypassed for streams (the `isCacheable` predicate from
+  Phase 7 already returns false; the streaming branch sits before the
+  cache check anyway, so neither read nor write happens)
+- New `RequestLogRepository.insert` writes one `request_logs` row per
+  streaming outcome with `streaming=true` and one of: `success`,
+  `partial_failed` (tokens reached the client then upstream dropped),
+  `upstream_failed` (non-retryable error before first byte),
+  `all_providers_failed` (every candidate dropped pre-byte)
+- Usage is billed honestly: clean stream → upstream-reported usage;
+  partial stream → tokens accumulated from streamed deltas
+  (output tokens approximated via the `chars / 4` heuristic). Both
+  paths write to `usage_ledger`. `upstream_failed` and
+  `all_providers_failed` skip the ledger (no work done) but still
+  write `request_logs`
+
 ## What is intentionally NOT yet implemented
 
-SSE streaming end-to-end, `request_logs` writes,
-per-tenant/provider/model metrics, `GET /v1/usage` summary. Each lands
-in its own phase.
+`request_logs` writes for non-streaming paths,
+per-tenant/provider/model Prometheus histograms, `GET /v1/usage`
+summary. Each lands in its own phase.
 
 ## Repo layout
 
@@ -345,11 +408,14 @@ src/
       key.ts                 buildCacheKey (sha256 over tenant + routing + messages)
       policy.ts              isCacheable (non-streaming + temperature == 0)
       repository.ts          CacheRepository (Postgres-backed get/set)
-    streaming/               (placeholder)
+    streaming/
+      sse.ts                 formatSSEEvent (token / done / error wire format)
+      handler.ts             streamChatCompletion (failover before 1st byte; partial after)
     observability/
       metrics.ts             prom-client registry
       routes.ts              GET /metrics
-    persistence/             (placeholder)
+    persistence/
+      request-logs-repo.ts   RequestLogRepository (streaming outcomes write here)
 db/
   schema.ts                  Drizzle table definitions (7 tables)
   client.ts                  createDbHandle factory
@@ -369,6 +435,7 @@ tests/
   ratelimit.test.ts
   resilience.test.ts
   cache.test.ts
+  streaming.test.ts
 ```
 
 ## Useful one-liners

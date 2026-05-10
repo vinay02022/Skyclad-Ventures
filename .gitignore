@@ -7,6 +7,7 @@ coverage/
 .DS_Store
 .vscode/
 .idea/
+.cursor/
 
 # Local planning / assignment artifacts. Kept out of the public repo so the
 # submission shows the engineering work, not the brief or the build journal.

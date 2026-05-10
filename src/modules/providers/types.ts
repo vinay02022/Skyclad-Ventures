@@ -40,6 +40,18 @@ export interface UnifiedChatResponse {
   cost_usd: number;
   cached: boolean;
   created_at: string;
+  /**
+   * Routing summary. Always present so a client (or a debugging engineer)
+   * can see which policy ran, how many candidates it considered, and whether
+   * a failover happened. Cheap to compute, harmless to expose, very useful
+   * when reading logs alongside the response.
+   */
+  routing: {
+    policy: string;
+    candidate_count: number;
+    fallback_used: boolean;
+    reason: string;
+  };
 }
 
 // ----------------------------------------------------------------------------
@@ -61,6 +73,12 @@ export interface FailureInjection {
   afterChunks?: number;
   /** Optional artificial latency before doing the real (or failing) work. */
   delayMs?: number;
+  /**
+   * If set, only the named provider experiences this failure. Lets a
+   * failover test fail provider A while provider B answers normally —
+   * essential for proving the router falls through cleanly.
+   */
+  targetProvider?: string;
 }
 
 export interface ProviderChatRequest {

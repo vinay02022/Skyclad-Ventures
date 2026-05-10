@@ -16,6 +16,9 @@ import { registerObservabilityRoutes } from "./modules/observability/routes.js";
 import { buildProviderRegistry } from "./modules/providers/factory.js";
 import { PricingRepository } from "./modules/providers/pricing.js";
 import type { ProviderRegistry } from "./modules/providers/registry.js";
+import { CostOptimizedRoutingPolicy } from "./modules/routing/cost-optimized.js";
+import { AlwaysHealthyOracle } from "./modules/routing/health.js";
+import type { ProviderHealthOracle, RoutingPolicy } from "./modules/routing/types.js";
 import { TenantRepository } from "./modules/tenants/repository.js";
 import { registerTenantRoutes } from "./modules/tenants/routes.js";
 
@@ -29,6 +32,10 @@ export interface BuildAppOptions {
   // Tests can pass in their own registry (e.g. with always-failing adapters).
   // Production code lets buildApp construct a default mock registry below.
   providers?: ProviderRegistry;
+  // Tests / future callers can swap in a different routing policy or health
+  // oracle. Defaults below are good for local + assignment scope.
+  policy?: RoutingPolicy;
+  health?: ProviderHealthOracle;
 }
 
 // App builder is separated from the listener so tests can use `app.inject(...)`
@@ -38,6 +45,8 @@ export async function buildApp({
   logger,
   db,
   providers,
+  policy,
+  health,
 }: BuildAppOptions): Promise<FastifyInstance> {
   const app = Fastify({
     // Pino's Logger is structurally compatible with FastifyBaseLogger at runtime;
@@ -84,7 +93,18 @@ export async function buildApp({
     // fresh clone runs end-to-end without OpenAI/Anthropic API keys.
     const providerRegistry = providers ?? buildProviderRegistry({ mode: "mock" });
     const pricingRepo = new PricingRepository(db);
-    await registerChatRoutes(app, { providers: providerRegistry, pricing: pricingRepo });
+    // Phase 4: route by cost across the tenant allowlist + provider health.
+    // AlwaysHealthyOracle is a placeholder until Phase 5's circuit breaker
+    // lands; the routing seam stays the same.
+    const routingPolicy = policy ?? new CostOptimizedRoutingPolicy();
+    const healthOracle = health ?? new AlwaysHealthyOracle();
+    await registerChatRoutes(app, {
+      providers: providerRegistry,
+      pricing: pricingRepo,
+      tenants: tenantRepo,
+      policy: routingPolicy,
+      health: healthOracle,
+    });
   }
 
   app.setNotFoundHandler((req, reply) => {

@@ -46,7 +46,10 @@ export abstract class MockProviderBase implements ProviderAdapter {
   async *stream(req: ProviderChatRequest): AsyncIterable<ProviderStreamChunk> {
     // pre-stream-drop is the "drops before any byte" failure mode. The
     // resilience layer is allowed to retry/failover when this happens.
-    if (req.failure?.mode === "pre-stream-drop") {
+    // Honors targetProvider for the same reason as applyPreCallFailure.
+    const targetMatches =
+      !req.failure?.targetProvider || req.failure.targetProvider === this.name;
+    if (req.failure?.mode === "pre-stream-drop" && targetMatches) {
       if (req.failure.delayMs) await sleep(req.failure.delayMs);
       throw new ProviderError("mock pre-stream drop", {
         statusCode: 503,
@@ -70,7 +73,8 @@ export abstract class MockProviderBase implements ProviderAdapter {
       if (
         req.failure?.mode === "stream-drop" &&
         typeof req.failure.afterChunks === "number" &&
-        i >= req.failure.afterChunks
+        i >= req.failure.afterChunks &&
+        targetMatches
       ) {
         throw new ProviderError("mock stream drop", {
           statusCode: 502,
@@ -100,6 +104,10 @@ export abstract class MockProviderBase implements ProviderAdapter {
   // Common pre-call failure handler shared by complete() and stream().
   private async applyPreCallFailure(failure: FailureInjection | undefined): Promise<void> {
     if (!failure) return;
+    // If a target provider is named, only that provider experiences this
+    // failure. Lets a failover test fail provider A while provider B
+    // answers normally on the same request.
+    if (failure.targetProvider && failure.targetProvider !== this.name) return;
     if (failure.delayMs) await sleep(failure.delayMs);
     switch (failure.mode) {
       case "5xx":

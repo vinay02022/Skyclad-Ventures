@@ -73,12 +73,18 @@ describe.skipIf(!dbAvailable)("POST /v1/chat/completions", () => {
         "model",
         "model_class",
         "provider",
+        "routing",
         "usage",
       ].sort(),
     );
     expect(body.model_class).toBe("cheap");
-    expect(body.provider).toBe("openai"); // default in Phase 3
-    expect(body.model).toBe("gpt-4o-mini"); // openai's default for "cheap"
+    // Phase 4: router picks openai because gpt-4o-mini is cheaper than
+    // claude-3-haiku for the cheap class with the seeded prices.
+    expect(body.provider).toBe("openai");
+    expect(body.model).toBe("gpt-4o-mini");
+    expect(body.routing.policy).toBe("cost-optimized");
+    expect(body.routing.fallback_used).toBe(false);
+    expect(body.routing.candidate_count).toBeGreaterThanOrEqual(2);
     expect(body.message.role).toBe("assistant");
     expect(body.message.content).toContain("[mock-openai]");
     expect(body.usage.input_tokens).toBeGreaterThan(0);
@@ -135,12 +141,15 @@ describe.skipIf(!dbAvailable)("POST /v1/chat/completions", () => {
     expect(res.json().error).toBe("unknown_provider");
   });
 
-  it("rejects model_class 'premium' on the openai mock (no model resolves)", async () => {
+  it("override path: pinning openai + premium without a model returns 400 no_model_for_class", async () => {
+    // openai's mock has no premium default model (premium-class lives on
+    // anthropic). When the caller forces openai we surface that explicitly
+    // rather than silently routing somewhere else.
     const res = await app.inject({
       method: "POST",
       url: "/v1/chat/completions",
       headers: tenantAHeaders,
-      payload: goodBody({ model_class: "premium" }),
+      payload: goodBody({ provider: "openai", model_class: "premium" }),
     });
     expect(res.statusCode).toBe(400);
     expect(res.json().error).toBe("no_model_for_class");
@@ -158,9 +167,64 @@ describe.skipIf(!dbAvailable)("POST /v1/chat/completions", () => {
     expect(body.provider).toBe("anthropic");
     expect(body.model).toBe("claude-3-opus-20240229");
     expect(body.message.content).toContain("[mock-anthropic]");
+    expect(body.routing.policy).toBe("override");
+    expect(body.routing.reason).toBe("caller_pinned");
   });
 
-  it("returns 502 when the provider is forced to fail with x-skyclad-fail: 5xx", async () => {
+  it("router-driven path: model_class 'premium' routes to anthropic for tenant_a", async () => {
+    // No provider override. Only anthropic has a premium model in the seed,
+    // so the cost-optimized router picks anthropic with no fallback.
+    const res = await app.inject({
+      method: "POST",
+      url: "/v1/chat/completions",
+      headers: tenantAHeaders,
+      payload: goodBody({ model_class: "premium" }),
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.provider).toBe("anthropic");
+    expect(body.routing.policy).toBe("cost-optimized");
+    expect(body.routing.fallback_used).toBe(false);
+  });
+
+  it("router-driven path: tenant_b asking for premium gets 503 (allowlist excludes anthropic)", async () => {
+    // tenant_b's allowlist is openai-only and openai serves no premium model,
+    // so no candidate survives. Honest 503 instead of a misleading 400.
+    const res = await app.inject({
+      method: "POST",
+      url: "/v1/chat/completions",
+      headers: tenantBHeaders,
+      payload: goodBody({ model_class: "premium" }),
+    });
+    expect(res.statusCode).toBe(503);
+    expect(res.json().error).toBe("no_provider_available");
+  });
+
+  it("fails over to anthropic when openai is forced to fail (x-skyclad-fail-provider: openai)", async () => {
+    // Router picks openai (cheapest cheap). openai blows up before any
+    // bytes are written. The handler must roll over to the next cheapest
+    // candidate (anthropic) and the response should reflect fallback_used.
+    const res = await app.inject({
+      method: "POST",
+      url: "/v1/chat/completions",
+      headers: {
+        ...tenantAHeaders,
+        "x-skyclad-fail": "5xx",
+        "x-skyclad-fail-provider": "openai",
+      },
+      payload: goodBody(),
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.provider).toBe("anthropic");
+    expect(body.routing.fallback_used).toBe(true);
+    expect(body.routing.policy).toBe("cost-optimized");
+  });
+
+  it("returns 502 all_providers_failed when every candidate fails (x-skyclad-fail: 5xx, no target)", async () => {
+    // No targetProvider -> both openai and anthropic blow up, so the
+    // failover loop exhausts the candidate list. Honest 502 with the
+    // attempt count and per-provider error trail.
     const res = await app.inject({
       method: "POST",
       url: "/v1/chat/completions",
@@ -169,9 +233,10 @@ describe.skipIf(!dbAvailable)("POST /v1/chat/completions", () => {
     });
     expect(res.statusCode).toBe(502);
     const body = res.json();
-    expect(body.error).toBe("provider_error");
-    expect(body.provider).toBe("openai");
-    expect(body.retryable).toBe(true);
+    expect(body.error).toBe("all_providers_failed");
+    expect(body.attempts).toBeGreaterThanOrEqual(2);
+    expect(Array.isArray(body.errors)).toBe(true);
+    expect(body.errors.length).toBeGreaterThanOrEqual(2);
   });
 
   it("returns 501 for stream:true (SSE wiring lands in a later phase)", async () => {

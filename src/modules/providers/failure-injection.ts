@@ -11,9 +11,12 @@ const VALID_MODES: ReadonlySet<FailureMode> = new Set([
 ]);
 
 // Header contract:
-//   x-skyclad-fail: <mode>             e.g. "5xx", "rate-limit", "stream-drop"
+//   x-skyclad-fail: <mode>             "5xx" | "rate-limit" | "timeout"
+//                                      | "stream-drop" | "pre-stream-drop"
 //   x-skyclad-fail-after: <number>     for stream-drop, chunks before failure
 //   x-skyclad-fail-delay: <number>     optional artificial latency in ms
+//   x-skyclad-fail-provider: <name>    only this provider sees the failure
+//                                      (essential for failover tests)
 //
 // The header surface (rather than a body field) means failure injection can
 // be turned on for any test without rewriting the body, and never appears in
@@ -35,6 +38,11 @@ export function parseFailureInjection(headers: IncomingHttpHeaders): FailureInje
   if (typeof delay === "string") {
     const n = Number.parseInt(delay, 10);
     if (Number.isFinite(n) && n >= 0) failure.delayMs = n;
+  }
+
+  const target = headers["x-skyclad-fail-provider"];
+  if (typeof target === "string" && target.trim().length > 0) {
+    failure.targetProvider = target.trim();
   }
 
   return failure;

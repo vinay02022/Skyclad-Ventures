@@ -229,8 +229,70 @@ Locked in so far:
   arrives alongside the per-tenant Prometheus histograms — the
   same insertion API serves both, so shipping the API now and the
   writers later costs nothing.
-
-More decisions get added as observability lands.
+- **One outcome recorder, two consumers.** Phase 9 lifts the
+  request-logs / metrics / Pino bookkeeping out of every terminal
+  in the chat handler and into a single function,
+  `recordRequestOutcome(outcome)`. Both the streaming handler and
+  the non-streaming handler call it. The contract: if there is a
+  `request_logs` row, there is a Prometheus increment, and there
+  is a structured Pino log line — and they all carry the same set
+  of labels. Eliminates the failure mode where a 4xx terminal
+  remembers to log but forgets to bump a counter (or vice versa).
+- **Logs are the operational artefact; metrics are the
+  dashboardable artefact; the ledger is the billable artefact.**
+  Three different audiences, three different stores. An on-call
+  engineer pulls structured logs by `request_id`. A platform
+  engineer queries Prometheus for `gateway_errors_total` by
+  `provider` to spot upstream issues. Finance reads
+  `usage_ledger` (or the admin usage endpoint that aggregates it)
+  for billing. Splitting them up front avoids the classic mistake
+  of "let's just query the logs for billing" — which collapses
+  the moment log volume forces sampling.
+- **Prometheus label cardinality is a known cliff.** `tenant_id`
+  appears as a label on five of the seven gateway metrics. With
+  the seeded two tenants this is harmless. At fleet scale (1k+
+  tenants × 2 providers × 5 models × N statuses) it explodes the
+  registry. The two production fixes both work behind the same
+  metrics shape: drop `tenant_id` from the labels (per-tenant
+  breakdowns move to logs / OLAP), or aggressively bucket it
+  (top-N tenants get their own series, the rest collapse to
+  `tenant_id="other"`). Documented here, not implemented, because
+  the assignment scope guarantees a tenant count where neither is
+  needed.
+- **Breaker state gauge is read at scrape time.** The
+  `gateway_provider_circuit_state` gauge is registered with a
+  `collect()` callback that snapshots the
+  `CircuitBreakerRegistry` when Prometheus scrapes. No background
+  poller, no race between writes (state transitions) and reads
+  (scrapes), no risk of a stale gauge surviving a state change.
+  Trade-off: the gauge value is "what the breaker said the last
+  time someone scraped," not "right now" — but Prometheus's data
+  model is scrape-based anyway, so this is the correct shape.
+- **Admin endpoint protected by a single `ADMIN_TOKEN`, not full
+  RBAC.** The assignment scope is "an evaluator answers 'how
+  much has tenant_a spent this week?'" and that is exactly what
+  `GET /admin/tenants/:tenantId/usage` does. Bearer
+  authentication via `ADMIN_TOKEN` env var, no per-operator
+  users, no audit log of who hit `/admin`, no rotation flow.
+  Production gaps: one shared secret can't be revoked per
+  operator; a leaked token plus a tight loop could DoS the
+  `usage_ledger` table since `/admin` is not rate-limited; the
+  `request_logs` row for an admin call only knows "admin", not
+  which human. All of these would be solved together by an OIDC
+  layer in front of the gateway.
+- **Admin endpoint fails closed when unconfigured.**
+  `ADMIN_TOKEN=""` (or unset) means the `/admin/*` plugin is not
+  mounted at all. A misconfigured deploy returns 404, never 200,
+  to anyone probing the path. The alternative — mounting with a
+  blank token and rejecting all requests — leaks the existence of
+  the endpoint and risks a future "if (token === '')" bug.
+- **Half-open date range on the admin usage query.** `from` and
+  `to` are inclusive day labels in the URL but the SQL filter is
+  `created_at >= from AND created_at < to+1day`. This means
+  `from=2026-05-10&to=2026-05-10` is "all of 2026-05-10 UTC,"
+  which is what a human typing it expects. Standard library
+  convention; the same shape is used everywhere date-range
+  aggregation matters (Datadog, Stripe, etc.).
 
 ## 4. Failure modes
 

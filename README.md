@@ -151,6 +151,16 @@ curl -N -X POST http://localhost:8080/v1/chat/completions \
 # Inspect what got logged for the partial failure
 docker exec -it skyclad-postgres psql -U gateway -d gateway -c \
   "SELECT request_id, status, streaming, provider, output_tokens, error_type FROM request_logs ORDER BY created_at DESC LIMIT 5;"
+
+# Phase 9: Prometheus metrics. The seven gateway_* series appear in the
+# output once they have been incremented at least once by a request.
+curl -s http://localhost:8080/metrics | grep '^gateway_' | head -20
+
+# Phase 9: per-tenant usage summary. Only mounted when ADMIN_TOKEN is set
+# in the environment (see .env.example). Unset = 404 to anyone.
+export ADMIN_TOKEN="local-dev-admin-token"   # restart the server after setting
+curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
+  "http://localhost:8080/admin/tenants/00000000-0000-0000-0000-00000000000a/usage?from=2026-05-01&to=2026-05-31" | jq .
 ```
 
 ### Failure injection knobs (mock providers only)
@@ -190,6 +200,8 @@ spurious failures on a fresh clone.
 | `tests/resilience.test.ts` | `ResilientAdapter` retries transient errors and succeeds on a later attempt; does NOT retry 4xx; exhausts retries and bubbles. `withTimeout` synthesizes a 504 retryable error. `CircuitBreaker` state machine: opens after threshold, transitions OPEN→HALF_OPEN after cooldown, lets exactly one probe through, closes on probe success or reopens on probe failure. `CircuitBreakerRegistry` as `ProviderHealthOracle` reports OPEN providers unhealthy and recovers after cooldown. End-to-end failover when one provider's circuit is OPEN. |
 | `tests/cache.test.ts` | `buildCacheKey` is deterministic, includes `tenant_id`, includes `provider`/`model`, ignores extra message fields, and returns 64-char sha256 hex. `isCacheable` rejects streaming and `temperature > 0`. `CacheRepository` set/get round-trips, isolates tenants on the same key, upserts on conflict, returns null for expired rows. End-to-end: same request hits cache on second call (`cached:true`, `cost_usd:0`, `routing.policy:"cache"`); cache hit writes no `usage_ledger` row; tenant_b doesn't see tenant_a's cache; streaming bypasses cache; `temperature > 0` bypasses cache; expired row causes a real provider call. |
 | `tests/streaming.test.ts` | `formatSSEEvent` emits the right wire format for token/done/error. End-to-end SSE: `text/event-stream` headers; multiple `token` events followed by exactly one `done`; ledger and `request_logs` rows written on success (`streaming=true`, `status=success`, `cache_hit=false`); cache fully bypassed for streaming. Failover before first byte succeeds silently (anthropic answers when openai pre-drops). After-N-tokens drop emits exactly one `error` event with `partial:true` and NO `done` after it; partial response is logged with `status=partial_failed` and tenant is billed for what was actually sent. All-providers-pre-drop emits one `error` with `partial:false` and logs `status=all_providers_failed`. Tenant isolation under concurrent streams. |
+| `tests/observability.test.ts` | Successful non-streaming request writes a complete `request_logs` row (`tenant_id`, `provider`, `model`, `status=success`, `latency_ms`, `input_tokens`, `output_tokens`, `cost_usd`, `cache_hit=false`, `streaming=false`). Forced provider failure writes a row with `status=all_providers_failed` and `error_type` populated, AND increments `gateway_errors_total`. The seven gateway-level Prometheus series are present in the registry serialization, with `tenant_id` / `provider` / `model` / `status` labels populated and tokens partitioned by `token_type`. |
+| `tests/admin-usage.test.ts` | `GET /admin/tenants/:tenantId/usage` rejects no-token (401) and wrong-token (401), validates date params (400 on malformed or `from > to`), returns zero totals (not 404) for empty ranges, aggregates `usage_ledger` rows correctly into `total_*` / `by_provider` / `by_model`, and is fully tenant-isolated (tenant_b's response never carries tenant_a's numbers). |
 
 ## What is implemented so far
 
@@ -351,11 +363,47 @@ spurious failures on a fresh clone.
   `all_providers_failed` skip the ledger (no work done) but still
   write `request_logs`
 
+**Phase 9 — observability (logs, metrics, admin usage)**
+
+- Single `recordRequestOutcome` helper in `observability/outcome.ts` is
+  the one call site that, for every terminal in both the streaming and
+  non-streaming paths, (a) writes a `request_logs` row, (b) updates the
+  seven Prometheus series, (c) emits the structured Pino log line. Logs
+  and metrics can no longer drift apart.
+- `request_logs` is now written for every outcome — `success`,
+  `partial_failed`, `upstream_failed`, `all_providers_failed`,
+  `rate_limited`, `budget_exceeded`, `invalid_request`,
+  `no_provider_available` — with the assignment-listed fields
+  (`request_id`, `tenant_id`, `provider`, `model`, `status`,
+  `error_type`, `latency_ms`, `cache_hit`, `streaming`,
+  `input_tokens`, `output_tokens`, `cost_usd`) populated.
+- `GET /metrics` exposes the seven gateway-level series in addition
+  to Node default metrics:
+  - `gateway_requests_total{tenant_id, provider, model, status}`
+  - `gateway_errors_total{tenant_id, provider, error_type}`
+  - `gateway_latency_ms{provider, model}` (histogram)
+  - `gateway_tokens_total{tenant_id, provider, model, token_type}`
+  - `gateway_cost_usd_total{tenant_id, provider, model}`
+  - `gateway_cache_hits_total{tenant_id}`
+  - `gateway_provider_circuit_state{provider, state}` (gauge with
+    `collect()` callback that snapshots the breaker registry at scrape
+    time — no background poller, no stale state)
+- `GET /admin/tenants/:tenantId/usage?from=YYYY-MM-DD&to=YYYY-MM-DD`
+  returns `{ tenant_id, total_cost_usd, total_input_tokens,
+  total_output_tokens, by_provider, by_model }` aggregated from
+  `usage_ledger` over a half-open date range. Bearer-protected by a
+  single `ADMIN_TOKEN` env var.
+- `ADMIN_TOKEN` empty / unset → `/admin/*` is not mounted at all
+  (404 to anyone). Misconfigured deploy fails closed.
+
 ## What is intentionally NOT yet implemented
 
-`request_logs` writes for non-streaming paths,
-per-tenant/provider/model Prometheus histograms, `GET /v1/usage`
-summary. Each lands in its own phase.
+This is the last assignment phase; nothing scoped is missing. Production
+gaps that are deliberately out of scope (called out in `DESIGN.md`):
+multi-instance circuit-breaker state via Redis pub/sub, atomic budget
+reservation against the ledger, RBAC on the admin surface, and dropping
+`tenant_id` from Prometheus labels at fleet scale to control series
+cardinality.
 
 ## Repo layout
 
@@ -412,10 +460,14 @@ src/
       sse.ts                 formatSSEEvent (token / done / error wire format)
       handler.ts             streamChatCompletion (failover before 1st byte; partial after)
     observability/
-      metrics.ts             prom-client registry
+      metrics.ts             prom-client default registry + Node defaults
+      gateway-metrics.ts     7 gateway-level series + breaker-state gauge
+      outcome.ts             recordRequestOutcome (request_logs + metrics + log line)
       routes.ts              GET /metrics
+    admin/
+      routes.ts              GET /admin/tenants/:id/usage (ADMIN_TOKEN-gated)
     persistence/
-      request-logs-repo.ts   RequestLogRepository (streaming outcomes write here)
+      request-logs-repo.ts   RequestLogRepository (writes for every terminal)
 db/
   schema.ts                  Drizzle table definitions (7 tables)
   client.ts                  createDbHandle factory
@@ -436,6 +488,8 @@ tests/
   resilience.test.ts
   cache.test.ts
   streaming.test.ts
+  observability.test.ts
+  admin-usage.test.ts
 ```
 
 ## Useful one-liners

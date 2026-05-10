@@ -74,8 +74,55 @@ Locked in so far:
   does not cache `tenants.rate_limit_per_minute`. Every call passes the
   current value in (lifted from `req.tenant`, set by the auth hook).
   Reconfiguring a tenant's cap takes effect on the very next request.
+- **Resilience is a wrapper, not a framework.** Every `ProviderAdapter`
+  is wrapped at registry build time with a `ResilientAdapter` that
+  composes three controls: a timeout race (default 20s, expiry
+  synthesizes `ProviderError(504, retryable=true)`), bounded retries
+  on retryable errors only (200ms/500ms backoff with 30% jitter, 3
+  attempts), and a per-provider `CircuitBreaker`. The wrapper
+  implements the same `ProviderAdapter` interface as the inner
+  adapter, so the registry, router, and chat handler stay
+  unchanged. Cost: an extra await per call. Worth it.
+- **Retries are bounded and classified at one level.** The single
+  `defaultIsRetryable(err)` predicate is the only place "what counts as
+  retryable?" is decided. `ProviderError.retryable` is the wire-level
+  signal each adapter is responsible for setting honestly. 4xx
+  validation/auth errors are explicitly never retried — retrying a
+  malformed request just multiplies the user's bill.
+- **Circuit breaker is per-provider.** The thing that goes down is the
+  upstream, not (provider, model) or (tenant, provider). Tracking
+  failures at any finer grain dilutes the signal and slows recovery.
+  The breaker registry doubles as the `ProviderHealthOracle` Phase 4
+  introduced — when a breaker is OPEN, the router skips the provider
+  and the chat handler's failover loop rolls over to the next
+  candidate. No special-case wiring.
+- **Provider blast radius is bounded.** A provider going dark trips its
+  own breaker only. Tenants whose model_class can be served by another
+  provider keep getting answers (failover); tenants whose allowlist is
+  one-provider-deep get a clean `503 no_provider_available` so they
+  can decide what to do — instead of spending budget on retries that
+  will never work. No tenant-vs-tenant impact: the breaker is keyed on
+  provider name, the rate limiter is keyed on tenant_id, and the
+  budget gate reads only that tenant's ledger rows.
+- **Single-node breaker state — explicit production gap.** Each
+  process owns its own `CircuitBreakerRegistry`. Two replicas can hold
+  different views of the same upstream. Acceptable here because: each
+  view is locally correct (a node only opens after *it* sees 5
+  failures), recovery is independent (one node opening doesn't
+  prevent another from probing), and the blast radius is bounded by
+  per-node failover. Production fix is the same shape as for rate
+  limiting: a Redis-backed shared breaker (state + opened_at +
+  probe_lock) behind the same `ProviderHealthOracle` interface, with
+  a `SET NX EX` for the HALF_OPEN probe lock so exactly one node
+  probes at a time.
+- **Streaming has no retries.** Per the assignment: once bytes are
+  on the wire we never retry. `stream-drop` mock failures are
+  hard-coded `retryable: false`, the resilient adapter never wraps a
+  stream in a retry loop, and the breaker still records success/
+  failure for the stream attempt as a whole. SSE end-to-end + the
+  `partial=true` final event lands in a later phase.
 
-More decisions get added as adapters, routing, cache, and streaming land.
+More decisions get added as cache, streaming, and observability land.
 
 ## 4. Failure modes
 

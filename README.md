@@ -103,9 +103,9 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 
 | Header | Value | Effect |
 |---|---|---|
-| `x-skyclad-fail` | `5xx` | Adapter throws ProviderError(500, retryable). Endpoint returns 502. |
-| `x-skyclad-fail` | `rate-limit` | Adapter throws ProviderError(429, retryable). Endpoint returns 502. |
-| `x-skyclad-fail` | `timeout` | Adapter sleeps 60s. Phase 5 will race this against a timeout. |
+| `x-skyclad-fail` | `5xx` | Adapter throws ProviderError(500, retryable). Resilient wrapper retries up to 3 times before bubbling. |
+| `x-skyclad-fail` | `rate-limit` | Adapter throws ProviderError(429, retryable). Same retry path. |
+| `x-skyclad-fail` | `timeout` | Adapter sleeps 60s. Resilient wrapper races against the configured `timeoutMs` (default 20s) and synthesizes ProviderError(504, retryable). |
 | `x-skyclad-fail` | `pre-stream-drop` | `stream()` throws before any chunk. Safe to failover. |
 | `x-skyclad-fail` | `stream-drop` | `stream()` emits N chunks, then throws. Not retryable. |
 | `x-skyclad-fail-after` | integer | For `stream-drop`: number of chunks before the failure. |
@@ -133,6 +133,7 @@ spurious failures on a fresh clone.
 | `tests/routing.test.ts` | `CostOptimizedRoutingPolicy` unit tests with in-memory fakes: cheapest-wins, allowlist filter, missing-adapter filter, unhealthy-provider filter, returns null when nothing eligible, and the disabled-row contract (filtered in SQL). |
 | `tests/budget.test.ts` | `UsageLedgerRepository` round-trip + tenant isolation; chat endpoint writes a `usage_ledger` row on success; `402 TENANT_BUDGET_EXCEEDED` once the SUM crosses `monthly_budget_usd`; tenant_a still succeeds while tenant_b is over budget. |
 | `tests/ratelimit.test.ts` | `TokenBucket` unit (drain, refill, retryAfterMs, reconfigure clamp), `InMemoryRateLimiter` per-tenant isolation + reconfigure + `reset()`, integration: tenant_b at 10/min returns `429 TENANT_RATE_LIMITED` on burst 11, `Retry-After` header set, tenant_a unaffected. |
+| `tests/resilience.test.ts` | `ResilientAdapter` retries transient errors and succeeds on a later attempt; does NOT retry 4xx; exhausts retries and bubbles. `withTimeout` synthesizes a 504 retryable error. `CircuitBreaker` state machine: opens after threshold, transitions OPEN→HALF_OPEN after cooldown, lets exactly one probe through, closes on probe success or reopens on probe failure. `CircuitBreakerRegistry` as `ProviderHealthOracle` reports OPEN providers unhealthy and recovers after cooldown. End-to-end failover when one provider's circuit is OPEN. |
 
 ## What is implemented so far
 
@@ -214,12 +215,34 @@ spurious failures on a fresh clone.
 - Single-node-only by design; the pluggable `RateLimiter` interface is the
   seam a Redis-backed limiter slots into in production
 
+**Phase 6 — resilience: timeout, retry, circuit breaker**
+
+- `ResilientAdapter` wraps every `ProviderAdapter` in the registry without
+  changing the chat handler or routing module
+- Per-call timeout (default 20s) via `Promise.race` against `setTimeout`;
+  expiry synthesizes `ProviderError(504, retryable=true)` so the rest of
+  the resilience stack treats a slow upstream like an upstream 5xx
+- Bounded retries on retryable errors only (200ms then 500ms backoff +
+  30% jitter, 3 attempts total). `4xx` validation/auth errors are NEVER
+  retried; the underlying `ProviderError.retryable` flag is the
+  classifier
+- Per-provider `CircuitBreaker` (CLOSED → OPEN → HALF_OPEN). Opens after
+  5 failures in 60s, stays OPEN 30s, then HALF_OPEN admits exactly one
+  probe — success closes, failure reopens with the cooldown clock reset
+- `CircuitBreakerRegistry` doubles as the `ProviderHealthOracle` Phase 4
+  introduced — when a breaker is OPEN, the router skips the provider
+  with zero further wiring
+- Streaming has no retries by design (per the assignment: never after
+  bytes have been sent); the breaker still protects stream calls
+- Structured logs: `transient provider error, retrying` per attempt,
+  `circuit breaker state change` on every transition, `provider call
+  succeeded after retry` when retries actually saved a request
+
 ## What is intentionally NOT yet implemented
 
-Retries with backoff, circuit breaker (slots into the existing
-`ProviderHealthOracle` seam), per-call timeout via `AbortController`,
-response cache, SSE streaming end-to-end, `request_logs` writes,
-per-tenant/provider/model metrics. Each lands in its own phase.
+Response cache, SSE streaming end-to-end, `request_logs` writes,
+per-tenant/provider/model metrics, `GET /v1/usage` summary. Each lands
+in its own phase.
 
 ## Repo layout
 
@@ -260,7 +283,12 @@ src/
     ratelimit/
       token-bucket.ts        Single-node TokenBucket (time-injectable for tests)
       rate-limiter.ts        RateLimiter interface + InMemoryRateLimiter
-    resilience/              (placeholder)
+    resilience/
+      types.ts               BreakerState, RetryPolicy, ResilienceConfig
+      defaults.ts            DEFAULT_RESILIENCE_CONFIG (20s timeout, 3 attempts, 5/60s breaker)
+      circuit-breaker.ts     CircuitBreaker + CircuitBreakerRegistry (= ProviderHealthOracle)
+      resilient-adapter.ts   ResilientAdapter wrapper + withTimeout helper
+      factory.ts             buildResilientRegistry (wraps every adapter in the registry)
     cache/                   (placeholder)
     streaming/               (placeholder)
     observability/
@@ -284,6 +312,7 @@ tests/
   routing.test.ts
   budget.test.ts
   ratelimit.test.ts
+  resilience.test.ts
 ```
 
 ## Useful one-liners

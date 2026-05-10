@@ -11,7 +11,11 @@ import type { Logger } from "pino";
 import type { Database } from "../db/client.js";
 import type { AppConfig } from "./config.js";
 import { registerAuthHook } from "./modules/auth/hook.js";
+import { registerChatRoutes } from "./modules/chat/routes.js";
 import { registerObservabilityRoutes } from "./modules/observability/routes.js";
+import { buildProviderRegistry } from "./modules/providers/factory.js";
+import { PricingRepository } from "./modules/providers/pricing.js";
+import type { ProviderRegistry } from "./modules/providers/registry.js";
 import { TenantRepository } from "./modules/tenants/repository.js";
 import { registerTenantRoutes } from "./modules/tenants/routes.js";
 
@@ -22,11 +26,19 @@ export interface BuildAppOptions {
   // an app without spinning up a Postgres connection. Any /v1 functionality
   // requires a db.
   db?: Database;
+  // Tests can pass in their own registry (e.g. with always-failing adapters).
+  // Production code lets buildApp construct a default mock registry below.
+  providers?: ProviderRegistry;
 }
 
 // App builder is separated from the listener so tests can use `app.inject(...)`
 // without binding a real port.
-export async function buildApp({ config, logger, db }: BuildAppOptions): Promise<FastifyInstance> {
+export async function buildApp({
+  config,
+  logger,
+  db,
+  providers,
+}: BuildAppOptions): Promise<FastifyInstance> {
   const app = Fastify({
     // Pino's Logger is structurally compatible with FastifyBaseLogger at runtime;
     // the cast bridges a small declared-type gap (msgPrefix) without dragging
@@ -67,6 +79,12 @@ export async function buildApp({ config, logger, db }: BuildAppOptions): Promise
     const tenantRepo = new TenantRepository(db);
     registerAuthHook(app, tenantRepo);
     await registerTenantRoutes(app, tenantRepo);
+
+    // Phase 3: chat completions. Default to the mock-mode registry so a
+    // fresh clone runs end-to-end without OpenAI/Anthropic API keys.
+    const providerRegistry = providers ?? buildProviderRegistry({ mode: "mock" });
+    const pricingRepo = new PricingRepository(db);
+    await registerChatRoutes(app, { providers: providerRegistry, pricing: pricingRepo });
   }
 
   app.setNotFoundHandler((req, reply) => {

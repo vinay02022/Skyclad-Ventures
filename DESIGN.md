@@ -293,6 +293,79 @@ Locked in so far:
   which is what a human typing it expects. Standard library
   convention; the same shape is used everywhere date-range
   aggregation matters (Datadog, Stripe, etc.).
+- **Real adapters fit behind the same `ProviderAdapter` interface
+  as the mocks; no caller changes.** `OpenAIProvider` and
+  `AnthropicProvider` implement `complete()` / `stream()` /
+  `resolveDefaultModel()` exactly as the mocks do. The chat
+  handler, the streaming handler, the routing module, the
+  resilience wrapper, the cache, the request-log writer, and the
+  Prometheus counters are byte-identical between mock and live
+  modes. The factory swaps implementations behind a name lookup;
+  nothing downstream knows the difference. This is the payoff
+  for putting `ProviderAdapter` between the gateway and the
+  upstream from Phase 3 — the real-adapter phase touches no
+  module other than `providers/` and `app.ts`.
+- **Mock mode is the default; live mode is per-provider opt-in
+  with mock fallback.** `MOCK_PROVIDERS=true` (the default) wires
+  both upstreams as in-process mocks. `MOCK_PROVIDERS=false`
+  switches to real adapters per-provider: a missing key for one
+  provider falls back to mock with a logged warning, the other
+  provider is unaffected. Two consequences this trades for:
+  (a) `npm test` cannot ever bill a real account by accident —
+  the test suite uses mocks unconditionally and the new
+  real-adapter tests inject a fake `fetch`; (b) a developer can
+  iterate against one real upstream and one mock upstream
+  without flipping a global switch. Cost: a fresh deploy of
+  `MOCK_PROVIDERS=false` with both keys missing silently runs
+  on mocks; the warnings in startup logs are the only signal,
+  which is why we log them at WARN (not INFO) and surface the
+  resolved (mock|real) per-provider in the "provider registry
+  built" line.
+- **Hand-rolled SSE parser, not a dependency.** `parseSseStream`
+  is ~70 lines and handles exactly what both real upstreams
+  produce: `data:` field, `event:` field, comments (`:` prefix),
+  blank-line dispatch, `\r\n` line endings, chunk-boundary
+  splitting, and EOF without a trailing blank line. Pulling
+  `eventsource-parser` from npm would have added a dependency
+  to audit, version-pin, and license-review for behaviour we
+  could verify in a single test file. The cost of in-housing it:
+  one more file to keep correct; the mitigation: 7 unit tests
+  including the chunk-boundary case that would catch the
+  classic regression.
+- **Single error classifier shared by both real adapters.**
+  `mapHttpStatusToProviderError` is the only place that decides
+  "is this status retryable?" — used by OpenAI and Anthropic
+  both, returns the existing `ProviderError` shape that the
+  resilience layer / chat handler / circuit breaker already
+  consume from the mocks. The classification matches the
+  assignment spec literally: 4xx not retryable except 429 (which
+  goes retryable, so the resilient wrapper retries-then-fails-
+  over per the "may fallback" wording), 5xx retryable, transport
+  failures and AbortError retryable. New providers added later
+  reuse this classifier instead of inventing their own.
+- **Token usage prefers upstream figures, falls back to the
+  estimator.** OpenAI's `usage.prompt_tokens`/`completion_tokens`
+  and Anthropic's `usage.input_tokens`/`output_tokens` (from
+  `message_start` for input, `message_delta` for output) are
+  used verbatim when present. When absent (rare, but possible
+  during streaming if `stream_options.include_usage` is dropped
+  by a proxy), we fall back to the existing chars/4 heuristic
+  the rest of the gateway already uses. The fallback path is
+  not a guess masquerading as truth — it's the same
+  approximation the cost-routing math uses pre-call, so worst-
+  case the billed cost matches what the router thought the
+  request would cost.
+- **Streaming opts in to upstream usage, on purpose.** OpenAI
+  doesn't include a usage block in streamed responses unless
+  the request body sets `stream_options.include_usage: true`.
+  Anthropic always includes it (in `message_start` /
+  `message_delta`). We always opt in for OpenAI, because the
+  alternative is estimating output tokens from the deltas we
+  forwarded — which would re-open the abuse vector Phase 8's
+  "bill what we sent" rule was designed to close, just from a
+  slightly different angle. The cost is one extra field in the
+  request body that adds nothing to the response from upstream's
+  perspective.
 
 ## 4. Failure modes
 

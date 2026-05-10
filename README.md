@@ -27,6 +27,12 @@ npm run dev
 
 The server boots on `http://localhost:8080`.
 
+> **Provider mode.** `MOCK_PROVIDERS=true` (the default) uses
+> deterministic in-process mock adapters for both `openai` and
+> `anthropic` so this Quick Start, every test, and every demo runs
+> with **zero external calls and zero spend**. Real adapters land in
+> the next section.
+
 ```bash
 curl http://localhost:8080/health
 curl http://localhost:8080/metrics
@@ -163,6 +169,61 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
   "http://localhost:8080/admin/tenants/00000000-0000-0000-0000-00000000000a/usage?from=2026-05-01&to=2026-05-31" | jq .
 ```
 
+### Running with real OpenAI / Anthropic providers (Phase 10)
+
+Mock mode (the default) is the right choice for everything except a
+demo against a live model. To switch on the real adapters:
+
+```bash
+# 1. Provide one or both API keys.
+export OPENAI_API_KEY=sk-...
+export ANTHROPIC_API_KEY=sk-ant-...
+
+# 2. Flip the mode flag.
+export MOCK_PROVIDERS=false
+
+# 3. Restart the server.
+npm run dev
+```
+
+Behaviour:
+
+- `MOCK_PROVIDERS=false` + both keys set → both upstreams are real.
+- `MOCK_PROVIDERS=false` + one key missing → that one provider falls
+  back to mock with a logged warning; the other is real. Lets you
+  test the OpenAI path without an Anthropic key (or vice versa).
+- `MOCK_PROVIDERS=false` + both keys missing → both fall back to mock
+  with two warnings. The server still boots; you'll see warnings in
+  the logs telling you the mode was a no-op.
+- `MOCK_PROVIDERS=true` (or unset) → always mock, regardless of keys.
+  This is the safe default and the value the test suite uses.
+
+Both real adapters implement the **same `ProviderAdapter` interface**
+as the mocks. Routing, failover, the resilience wrapper, the cache,
+the streaming handler, `request_logs`, the Prometheus metrics, and
+the admin usage endpoint all work identically in either mode — the
+only thing that changes is whose servers handle the actual generation.
+
+### Avoiding provider spend during evaluation
+
+The default flow already avoids spend:
+
+- `npm test` always runs with mocks. The 156-test suite never makes a
+  network call to a real provider; the real-adapter tests inject a
+  fake `fetch` so request shape, error mapping, and SSE parsing are
+  all verified against constructed `Response` objects.
+- `npm run dev` with `.env.example` copied verbatim runs in mock mode
+  even if you've exported real `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`
+  in your shell — `MOCK_PROVIDERS=true` overrides them.
+- The seeded provider price table is the source of truth for cost
+  calculations regardless of mode, so dashboards and billing math
+  give the same answer in mock mode and real mode.
+
+If you want to demo against real upstreams without leaving the gateway
+running on real keys: `unset MOCK_PROVIDERS` (or set it back to
+`true`) when you're done; the server picks the new value up on
+restart.
+
 ### Failure injection knobs (mock providers only)
 
 | Header | Value | Effect |
@@ -202,6 +263,8 @@ spurious failures on a fresh clone.
 | `tests/streaming.test.ts` | `formatSSEEvent` emits the right wire format for token/done/error. End-to-end SSE: `text/event-stream` headers; multiple `token` events followed by exactly one `done`; ledger and `request_logs` rows written on success (`streaming=true`, `status=success`, `cache_hit=false`); cache fully bypassed for streaming. Failover before first byte succeeds silently (anthropic answers when openai pre-drops). After-N-tokens drop emits exactly one `error` event with `partial:true` and NO `done` after it; partial response is logged with `status=partial_failed` and tenant is billed for what was actually sent. All-providers-pre-drop emits one `error` with `partial:false` and logs `status=all_providers_failed`. Tenant isolation under concurrent streams. |
 | `tests/observability.test.ts` | Successful non-streaming request writes a complete `request_logs` row (`tenant_id`, `provider`, `model`, `status=success`, `latency_ms`, `input_tokens`, `output_tokens`, `cost_usd`, `cache_hit=false`, `streaming=false`). Forced provider failure writes a row with `status=all_providers_failed` and `error_type` populated, AND increments `gateway_errors_total`. The seven gateway-level Prometheus series are present in the registry serialization, with `tenant_id` / `provider` / `model` / `status` labels populated and tokens partitioned by `token_type`. |
 | `tests/admin-usage.test.ts` | `GET /admin/tenants/:tenantId/usage` rejects no-token (401) and wrong-token (401), validates date params (400 on malformed or `from > to`), returns zero totals (not 404) for empty ranges, aggregates `usage_ledger` rows correctly into `total_*` / `by_provider` / `by_model`, and is fully tenant-isolated (tenant_b's response never carries tenant_a's numbers). |
+| `tests/providers-real.test.ts` | Pure-function coverage for the SSE parser (chunk-boundary mid-line, `\r\n` endings, comment lines, multi-line `data:`, EOF flush) and `mapHttpStatusToProviderError` (400/401/422 → not retryable, 429 → retryable, 5xx → retryable, transport AbortError → 504, other transport → 503). `OpenAIProvider`: rejects empty key; `resolveDefaultModel` matches the seeded rows; `complete()` sends the right URL/headers/body and parses the response; missing `usage` falls back to the chars/4 estimator; all four error classes map correctly; `stream()` opts in via `stream_options.include_usage` and yields delta + done with upstream-reported usage; pre-stream 5xx maps to retryable. Same coverage for `AnthropicProvider` plus `hoistSystemMessages` (system role extracted to top-level), multi-text-block concatenation, and the named-event SSE shape (`message_start`, `content_block_delta`, `message_delta`, `message_stop`). |
+| `tests/factory.test.ts` | `mode: "mock"` wires both mocks; `mode: "live"` + both keys wires both real adapters; `mode: "live"` + one missing key falls back to mock for that provider only and emits exactly one warning; both keys missing emits two warnings; `fetchImpl` and `baseUrl` overrides reach the real adapter for network-free tests. |
 
 ## What is implemented so far
 
@@ -396,14 +459,44 @@ spurious failures on a fresh clone.
 - `ADMIN_TOKEN` empty / unset → `/admin/*` is not mounted at all
   (404 to anyone). Misconfigured deploy fails closed.
 
+**Phase 10 — real OpenAI + Anthropic adapters**
+
+- `OpenAIProvider` (`POST /v1/chat/completions` with Bearer token,
+  optional `stream_options.include_usage` for streamed usage) and
+  `AnthropicProvider` (`POST /v1/messages` with `x-api-key`,
+  `anthropic-version: 2023-06-01`, system-message hoisting) both
+  implementing the same `ProviderAdapter` interface as the mocks.
+  Routing, failover, the resilience wrapper, the cache, the streaming
+  handler, `request_logs`, and `/metrics` work identically against
+  either kind of adapter.
+- Shared `parseSseStream` helper for both upstreams. Hand-rolled
+  (~70 lines) instead of pulling a dependency, with explicit handling
+  for chunk-boundary mid-line, `\r\n` endings, comment lines, and
+  EOF without a trailing blank line.
+- Single `mapHttpStatusToProviderError` + `mapTransportErrorToProviderError`
+  classification used by both real adapters: 4xx → not retryable
+  (no failover, no retry), 429 → retryable (gets retries plus
+  failover, the spec's "may fallback"), 5xx + transport (DNS, ECONN,
+  AbortError) → retryable. Mocks already throw the same `ProviderError`
+  shape, so the rest of the gateway sees one uniform error contract.
+- Token usage prefers upstream-reported figures (OpenAI's
+  `prompt_tokens`/`completion_tokens`, Anthropic's `usage` block in
+  `message_start` / `message_delta`) and falls back to the existing
+  chars/4 estimator only when the upstream omits them.
+- Mode selection via `MOCK_PROVIDERS` env var (default `true`). When
+  `false`, each provider goes real if its API key is set, otherwise
+  falls back to mock per-provider with a logged warning. Tests
+  default to mock mode unconditionally; the test suite never makes
+  a real network call.
+
 ## What is intentionally NOT yet implemented
 
-This is the last assignment phase; nothing scoped is missing. Production
-gaps that are deliberately out of scope (called out in `DESIGN.md`):
-multi-instance circuit-breaker state via Redis pub/sub, atomic budget
-reservation against the ledger, RBAC on the admin surface, and dropping
-`tenant_id` from Prometheus labels at fleet scale to control series
-cardinality.
+Nothing scoped to the assignment is missing. Production gaps that are
+deliberately out of scope (called out in `DESIGN.md`): multi-instance
+circuit-breaker state via Redis pub/sub, atomic budget reservation
+against the ledger, RBAC on the admin surface, dropping `tenant_id`
+from Prometheus labels at fleet scale, and tokenizer-accurate token
+counts (vs the chars/4 heuristic) for pre-call routing decisions.
 
 ## Repo layout
 
@@ -432,8 +525,12 @@ src/
       mock-base.ts           Shared mock behaviour (failures, streaming)
       mock-openai.ts         MockOpenAIProvider (registered as "openai")
       mock-anthropic.ts      MockAnthropicProvider (registered as "anthropic")
+      openai-real.ts         OpenAIProvider (real chat/completions adapter)
+      anthropic-real.ts      AnthropicProvider (real messages API adapter)
+      sse-parser.ts          Shared line-based SSE parser used by both real adapters
+      http-errors.ts         mapHttpStatusToProviderError + mapTransportErrorToProviderError
       registry.ts            ProviderRegistry (in-memory map by name)
-      factory.ts             buildProviderRegistry({ mode })
+      factory.ts             buildProviderRegistry({ mode, keys, ... }) — mock vs live + per-provider fallback
       pricing.ts             PricingRepository + calculateCost (+ listEnabledByModelClass)
     routing/
       types.ts               RoutingPolicy, RouteCandidate, RoutingDecision, ProviderHealthOracle
@@ -490,6 +587,8 @@ tests/
   streaming.test.ts
   observability.test.ts
   admin-usage.test.ts
+  providers-real.test.ts
+  factory.test.ts
 ```
 
 ## Useful one-liners

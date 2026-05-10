@@ -1,8 +1,8 @@
 # Skyclad LLM Gateway
 
 Multi-tenant LLM gateway built for the Skyclad Ventures Senior Backend Engineer
-assignment. This README is a Phase 1 placeholder and will be filled in as
-features land. The full DESIGN.md follows the same trajectory.
+assignment. This README evolves alongside the code; the full DESIGN.md follows
+the same trajectory.
 
 ## Stack
 
@@ -14,12 +14,14 @@ features land. The full DESIGN.md follows the same trajectory.
 - Vitest for tests
 - Docker Compose for local Postgres
 
-## Quick start (Phase 1)
+## Quick start
 
 ```bash
 cp .env.example .env
 docker compose up -d postgres
 npm install
+npm run db:migrate     # create tenants, api_keys, usage_ledger, etc.
+npm run db:seed        # insert tenant_a / tenant_b and provider price table
 npm run dev
 ```
 
@@ -28,6 +30,14 @@ The server boots on `http://localhost:8080`.
 ```bash
 curl http://localhost:8080/health
 curl http://localhost:8080/metrics
+
+# Authenticated identity check (tenant_a)
+curl -H "Authorization: Bearer sk_test_tenanta_demo_key_DO_NOT_USE_IN_PROD" \
+  http://localhost:8080/v1/me
+
+# tenant_b has a smaller budget and only OpenAI in its allowlist
+curl -H "Authorization: Bearer sk_test_tenantb_demo_key_DO_NOT_USE_IN_PROD" \
+  http://localhost:8080/v1/me
 ```
 
 ## Tests
@@ -36,40 +46,66 @@ curl http://localhost:8080/metrics
 npm test
 ```
 
-Phase 1 ships one test suite covering `/health` (including request id propagation)
-and the `/metrics` endpoint.
+The test suite uses a separate database (`gateway_test`) which the setup
+auto-creates on first run. Tests that need Postgres skip gracefully with a
+clear console message if the DB is unreachable, so `npm test` never produces
+spurious failures on a fresh clone.
 
-## What is implemented in Phase 1
+| Suite | Covers |
+|---|---|
+| `tests/health.test.ts` | `/health` returns ok, request id propagation, `/metrics` returns Prometheus exposition format. |
+| `tests/auth.test.ts` | Missing / unknown / valid bearer tokens, two seeded tenants, `/health` and `/metrics` are public. |
+| `tests/tenants.test.ts` | `TenantRepository` lookup by hashed API key, budget config read, allowlist read, tenant-A vs tenant-B isolation. |
+
+## What is implemented so far
+
+**Phase 1 — skeleton**
 
 - Fastify app builder + process entrypoint with graceful shutdown
 - `GET /health`
 - `GET /metrics` (Prometheus default Node metrics)
-- Request id correlation (inbound `x-request-id` honored, otherwise generated;
-  echoed in response header and tagged on every log line)
+- Request id correlation
 - Pino logger with redaction of auth headers
-- Zod-validated environment loader (fails fast on misconfiguration)
-- Drizzle client factory and migration directory (schema is empty by design;
-  tables land with the persistence phase)
-- Docker Compose with Postgres 16 and a healthcheck
-- Vitest test setup using `app.inject(...)` (no port binding)
+- Zod-validated environment loader
+- Drizzle client factory and migration directory
+- Docker Compose with Postgres 16 + healthcheck
+- Vitest test setup using `app.inject(...)`
 
-## What is intentionally NOT in Phase 1
+**Phase 2 — persistence + tenant auth**
 
-Tenants, API key auth, providers (OpenAI/Anthropic/mock), routing, retries,
-circuit breaker, cache, SSE streaming, request logging, usage ledger, budget
-enforcement, rate limiting. These land in subsequent phases.
+- Drizzle schema for `tenants`, `api_keys`, `provider_configs`,
+  `tenant_provider_allowlists`, `usage_ledger`, `request_logs`
+- Initial migration generated and applied via `npm run db:migrate`
+- Idempotent seed script with two tenants (different budgets and allowlists)
+- API keys stored as SHA-256 hashes; auth lookup is one indexed equality
+- Fastify `onRequest` auth hook protecting `/v1/*` (public paths still public)
+- `TenantRepository` with `findByApiKey`, `getBudgetConfig`, `getAllowlist`
+- `GET /v1/me` identity / smoke-test endpoint
+- Test infrastructure: separate `gateway_test` DB, auto-create on first run,
+  truncate-and-reseed before each suite
+
+## What is intentionally NOT yet implemented
+
+Providers (OpenAI / Anthropic / mock), routing, retries, circuit breaker,
+cache, SSE streaming, request logging, usage ledger writes, budget
+enforcement, rate limiting. Each lands in its own phase.
 
 ## Repo layout
 
 ```
 src/
-  app.ts                     Fastify app builder (request id, /health, error handler)
+  app.ts                     Fastify app builder (request id, /health, error handler, /v1 mount)
   server.ts                  Process entry, graceful shutdown
   config.ts                  Zod env validation
   logger.ts                  Pino setup
   modules/
-    auth/                    (placeholder)
-    tenants/                 (placeholder)
+    auth/
+      hash.ts                SHA-256 hash + key generator
+      hook.ts                Fastify onRequest auth hook (Bearer -> tenant)
+    tenants/
+      types.ts               AuthenticatedTenant interface
+      repository.ts          findByApiKey, getBudgetConfig, getAllowlist
+      routes.ts              GET /v1/me
     providers/               (placeholder)
     routing/                 (placeholder)
     resilience/              (placeholder)
@@ -80,10 +116,29 @@ src/
       routes.ts              GET /metrics
     persistence/             (placeholder)
 db/
-  schema.ts                  (empty in Phase 1)
-  client.ts                  Lazy pg pool + drizzle client
-  migrations/                (generated by drizzle-kit)
-  seed.ts                    Placeholder seed script
+  schema.ts                  Drizzle table definitions (6 tables)
+  client.ts                  createDbHandle factory
+  migrate.ts                 Programmatic migration runner
+  seed.ts                    Idempotent seedDatabase + script entry
+  seed-fixtures.ts           Shared seed/test constants (tenants, keys, prices)
+  migrations/                drizzle-kit-generated SQL
 tests/
-  health.test.ts             /health and /metrics smoke tests
+  setup/db.ts                Test DB bootstrap (auto-create, migrate, seed)
+  health.test.ts
+  auth.test.ts
+  tenants.test.ts
+```
+
+## Useful one-liners
+
+```bash
+# Reset the dev DB
+docker compose down -v && docker compose up -d postgres
+npm run db:migrate && npm run db:seed
+
+# See what's in the tenants table
+docker exec -it skyclad-postgres psql -U gateway -d gateway -c "SELECT id, name, monthly_budget_usd, rate_limit_per_minute FROM tenants;"
+
+# See what's in the price table
+docker exec -it skyclad-postgres psql -U gateway -d gateway -c "SELECT provider, model, model_class, input_cost_per_1k_tokens, output_cost_per_1k_tokens FROM provider_configs ORDER BY model_class, provider;"
 ```

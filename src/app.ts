@@ -8,17 +8,25 @@ import Fastify, {
 import { randomUUID } from "node:crypto";
 import type { Logger } from "pino";
 
+import type { Database } from "../db/client.js";
 import type { AppConfig } from "./config.js";
+import { registerAuthHook } from "./modules/auth/hook.js";
 import { registerObservabilityRoutes } from "./modules/observability/routes.js";
+import { TenantRepository } from "./modules/tenants/repository.js";
+import { registerTenantRoutes } from "./modules/tenants/routes.js";
 
 export interface BuildAppOptions {
   config: AppConfig;
   logger: Logger;
+  // Optional so the lightweight Phase 1 health/metrics test can still build
+  // an app without spinning up a Postgres connection. Any /v1 functionality
+  // requires a db.
+  db?: Database;
 }
 
 // App builder is separated from the listener so tests can use `app.inject(...)`
 // without binding a real port.
-export async function buildApp({ config, logger }: BuildAppOptions): Promise<FastifyInstance> {
+export async function buildApp({ config, logger, db }: BuildAppOptions): Promise<FastifyInstance> {
   const app = Fastify({
     // Pino's Logger is structurally compatible with FastifyBaseLogger at runtime;
     // the cast bridges a small declared-type gap (msgPrefix) without dragging
@@ -52,6 +60,14 @@ export async function buildApp({ config, logger }: BuildAppOptions): Promise<Fas
   }));
 
   await registerObservabilityRoutes(app);
+
+  // /v1 surface is only mounted when a database is supplied. Without it, auth
+  // can't run and there's no honest way to serve a tenant request.
+  if (db) {
+    const tenantRepo = new TenantRepository(db);
+    registerAuthHook(app, tenantRepo);
+    await registerTenantRoutes(app, tenantRepo);
+  }
 
   app.setNotFoundHandler((req, reply) => {
     reply.code(404).send({ error: "not_found", path: req.url });

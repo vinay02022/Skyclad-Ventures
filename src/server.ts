@@ -1,3 +1,4 @@
+import { createDbHandle } from "../db/client.js";
 import { buildApp } from "./app.js";
 import { loadConfig } from "./config.js";
 import { createLogger } from "./logger.js";
@@ -5,12 +6,14 @@ import { createLogger } from "./logger.js";
 async function main(): Promise<void> {
   const config = loadConfig();
   const logger = createLogger(config);
-  const app = await buildApp({ config, logger });
+  const dbHandle = createDbHandle(config.DATABASE_URL);
+  const app = await buildApp({ config, logger, db: dbHandle.db });
 
   const shutdown = async (signal: string): Promise<void> => {
     logger.info({ signal }, "shutting down");
     try {
       await app.close();
+      await dbHandle.close();
       process.exit(0);
     } catch (err) {
       logger.error({ err }, "error during shutdown");

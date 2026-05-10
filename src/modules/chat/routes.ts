@@ -5,6 +5,8 @@ import { buildCacheKey } from "../cache/key.js";
 import { isCacheable } from "../cache/policy.js";
 import type { CacheRepository } from "../cache/repository.js";
 import type { CacheConfig, CachedResponsePayload } from "../cache/types.js";
+import type { GatewayMetrics } from "../observability/gateway-metrics.js";
+import { recordRequestOutcome } from "../observability/outcome.js";
 import type { RequestLogRepository } from "../persistence/request-logs-repo.js";
 import { ProviderError } from "../providers/errors.js";
 import { parseFailureInjection } from "../providers/failure-injection.js";
@@ -37,6 +39,7 @@ export interface RegisterChatRoutesDeps {
   cache: CacheRepository;
   cacheConfig: CacheConfig;
   requestLogs: RequestLogRepository;
+  metrics: GatewayMetrics;
 }
 
 /**
@@ -77,14 +80,39 @@ export async function registerChatRoutes(
   deps: RegisterChatRoutesDeps,
 ): Promise<void> {
   app.post("/v1/chat/completions", async (req, reply) => {
+    const requestStart = Date.now();
     const tenant = req.tenant;
     if (!tenant) {
+      // Auth-failed requests are logged by the auth hook itself; we do
+      // NOT write a request_logs row here because we have no validated
+      // tenant_id (which we need for ledger correlation). Rate-limited
+      // and budget-exceeded requests, by contrast, do have a tenant.
       return reply.code(401).send({ error: "unauthorized", request_id: req.id });
     }
 
     // ---- 1. Validate ---------------------------------------------------
     const parsed = ChatRequestSchema.safeParse(req.body);
     if (!parsed.success) {
+      await recordRequestOutcome(
+        { requestLogs: deps.requestLogs, metrics: deps.metrics, log: req.log },
+        {
+          requestId: req.id,
+          tenantId: tenant.id,
+          provider: null,
+          model: null,
+          modelClass: null,
+          routePolicy: null,
+          routingReason: null,
+          cacheHit: false,
+          streaming: false,
+          latencyMs: Date.now() - requestStart,
+          inputTokens: null,
+          outputTokens: null,
+          costUsd: null,
+          status: "invalid_request",
+          errorType: "schema_validation_failed",
+        },
+      );
       return reply.code(400).send({
         error: "invalid_request",
         message: "Request body failed validation.",
@@ -121,6 +149,26 @@ export async function registerChatRoutes(
         },
         "tenant rate limited",
       );
+      await recordRequestOutcome(
+        { requestLogs: deps.requestLogs, metrics: deps.metrics, log: req.log },
+        {
+          requestId: req.id,
+          tenantId: tenant.id,
+          provider: null,
+          model: null,
+          modelClass: body.model_class,
+          routePolicy: null,
+          routingReason: null,
+          cacheHit: false,
+          streaming: body.stream,
+          latencyMs: Date.now() - requestStart,
+          inputTokens: null,
+          outputTokens: null,
+          costUsd: null,
+          status: "rate_limited",
+          errorType: "TENANT_RATE_LIMITED",
+        },
+      );
       return reply.code(429).send({
         error: "TENANT_RATE_LIMITED",
         message: `Rate limit of ${rate.capacity} req/min exceeded for this tenant.`,
@@ -147,6 +195,26 @@ export async function registerChatRoutes(
         },
         "tenant budget exceeded",
       );
+      await recordRequestOutcome(
+        { requestLogs: deps.requestLogs, metrics: deps.metrics, log: req.log },
+        {
+          requestId: req.id,
+          tenantId: tenant.id,
+          provider: null,
+          model: null,
+          modelClass: body.model_class,
+          routePolicy: null,
+          routingReason: null,
+          cacheHit: false,
+          streaming: body.stream,
+          latencyMs: Date.now() - requestStart,
+          inputTokens: null,
+          outputTokens: null,
+          costUsd: null,
+          status: "budget_exceeded",
+          errorType: "TENANT_BUDGET_EXCEEDED",
+        },
+      );
       return reply.code(402).send({
         error: "TENANT_BUDGET_EXCEEDED",
         message: `Tenant has spent $${monthSpend.toFixed(4)} of $${tenant.monthlyBudgetUsd.toFixed(2)} monthly budget.`,
@@ -169,6 +237,26 @@ export async function registerChatRoutes(
       // but we do NOT consult the cost policy and we do NOT fall over.
       const overrideOrError = resolveOverride(body, allowlist, deps);
       if ("error" in overrideOrError) {
+        await recordRequestOutcome(
+          { requestLogs: deps.requestLogs, metrics: deps.metrics, log: req.log },
+          {
+            requestId: req.id,
+            tenantId: tenant.id,
+            provider: typeof body.provider === "string" ? body.provider : null,
+            model: typeof body.model === "string" ? body.model : null,
+            modelClass: body.model_class,
+            routePolicy: "override",
+            routingReason: null,
+            cacheHit: false,
+            streaming: body.stream,
+            latencyMs: Date.now() - requestStart,
+            inputTokens: null,
+            outputTokens: null,
+            costUsd: null,
+            status: "no_provider_available",
+            errorType: String(overrideOrError.body.error ?? "override_invalid"),
+          },
+        );
         return reply.code(overrideOrError.statusCode).send({
           ...overrideOrError.body,
           request_id: req.id,
@@ -199,6 +287,26 @@ export async function registerChatRoutes(
             allowlist,
           },
           "no eligible provider for this tenant + model_class",
+        );
+        await recordRequestOutcome(
+          { requestLogs: deps.requestLogs, metrics: deps.metrics, log: req.log },
+          {
+            requestId: req.id,
+            tenantId: tenant.id,
+            provider: null,
+            model: null,
+            modelClass: body.model_class,
+            routePolicy: "cost",
+            routingReason: "no_eligible_candidate",
+            cacheHit: false,
+            streaming: body.stream,
+            latencyMs: Date.now() - requestStart,
+            inputTokens: null,
+            outputTokens: null,
+            costUsd: null,
+            status: "no_provider_available",
+            errorType: "no_eligible_candidate",
+          },
         );
         return reply.code(503).send({
           error: "no_provider_available",
@@ -278,17 +386,26 @@ export async function registerChatRoutes(
             reason: "cache_hit",
           },
         };
-        req.log.info(
+        await recordRequestOutcome(
+          { requestLogs: deps.requestLogs, metrics: deps.metrics, log: req.log },
           {
-            tenant_id: tenant.id,
-            cache_hit: true,
-            cache_key: cacheKey,
+            requestId: req.id,
+            tenantId: tenant.id,
             provider: hit.provider,
             model: hit.model,
-            input_tokens: hit.usage.input_tokens,
-            output_tokens: hit.usage.output_tokens,
+            modelClass: body.model_class,
+            routePolicy: "cache",
+            routingReason: "cache_hit",
+            cacheHit: true,
+            streaming: false,
+            latencyMs: Date.now() - requestStart,
+            inputTokens: hit.usage.input_tokens,
+            outputTokens: hit.usage.output_tokens,
+            // Cache hits do not bill the tenant — see Phase 7 docs.
+            costUsd: 0,
+            status: "success",
+            errorType: null,
           },
-          "chat completion ok (cache hit)",
         );
         return cachedResponse;
       }
@@ -433,23 +550,25 @@ export async function registerChatRoutes(
           }
         }
 
-        req.log.info(
+        await recordRequestOutcome(
+          { requestLogs: deps.requestLogs, metrics: deps.metrics, log: req.log },
           {
-            tenant_id: tenant.id,
-            route_policy: routePolicyName,
-            selected_provider: adapter.name,
-            selected_model: result.model,
-            reason: candidate.reason,
-            candidate_count: candidatesConsidered,
-            fallback_used: fallbackUsed,
-            attempts: attempt + 1,
-            latency_ms: latencyMs,
-            input_tokens: response.usage.input_tokens,
-            output_tokens: response.usage.output_tokens,
-            cost_usd: costUsd,
-            cache_hit: false,
+            requestId: req.id,
+            tenantId: tenant.id,
+            provider: adapter.name,
+            model: result.model,
+            modelClass: body.model_class,
+            routePolicy: routePolicyName,
+            routingReason: candidate.reason,
+            cacheHit: false,
+            streaming: false,
+            latencyMs: Date.now() - requestStart,
+            inputTokens: response.usage.input_tokens,
+            outputTokens: response.usage.output_tokens,
+            costUsd: costUsd,
+            status: "success",
+            errorType: null,
           },
-          "chat completion ok",
         );
 
         return response;
@@ -474,6 +593,26 @@ export async function registerChatRoutes(
               },
               "provider non-retryable error, no failover",
             );
+            await recordRequestOutcome(
+              { requestLogs: deps.requestLogs, metrics: deps.metrics, log: req.log },
+              {
+                requestId: req.id,
+                tenantId: tenant.id,
+                provider: adapter.name,
+                model: candidate.model,
+                modelClass: body.model_class,
+                routePolicy: routePolicyName,
+                routingReason: candidate.reason,
+                cacheHit: false,
+                streaming: false,
+                latencyMs: Date.now() - requestStart,
+                inputTokens: null,
+                outputTokens: null,
+                costUsd: null,
+                status: "upstream_failed",
+                errorType: `provider_${err.statusCode}`,
+              },
+            );
             return reply.code(502).send({
               error: "provider_error",
               provider: adapter.name,
@@ -493,6 +632,26 @@ export async function registerChatRoutes(
                 status_code: err.statusCode,
               },
               "override path provider error, no failover",
+            );
+            await recordRequestOutcome(
+              { requestLogs: deps.requestLogs, metrics: deps.metrics, log: req.log },
+              {
+                requestId: req.id,
+                tenantId: tenant.id,
+                provider: adapter.name,
+                model: candidate.model,
+                modelClass: body.model_class,
+                routePolicy: "override",
+                routingReason: candidate.reason,
+                cacheHit: false,
+                streaming: false,
+                latencyMs: Date.now() - requestStart,
+                inputTokens: null,
+                outputTokens: null,
+                costUsd: null,
+                status: "upstream_failed",
+                errorType: `provider_${err.statusCode}`,
+              },
             );
             return reply.code(502).send({
               error: "provider_error",
@@ -537,6 +696,27 @@ export async function registerChatRoutes(
         errors,
       },
       "all providers failed",
+    );
+    const lastCandidate = order[order.length - 1];
+    await recordRequestOutcome(
+      { requestLogs: deps.requestLogs, metrics: deps.metrics, log: req.log },
+      {
+        requestId: req.id,
+        tenantId: tenant.id,
+        provider: lastCandidate?.provider ?? null,
+        model: lastCandidate?.model ?? null,
+        modelClass: body.model_class,
+        routePolicy: routePolicyName,
+        routingReason: lastCandidate?.reason ?? null,
+        cacheHit: false,
+        streaming: false,
+        latencyMs: Date.now() - requestStart,
+        inputTokens: null,
+        outputTokens: null,
+        costUsd: null,
+        status: "all_providers_failed",
+        errorType: "all_providers_failed",
+      },
     );
     return reply.code(502).send({
       error: "all_providers_failed",

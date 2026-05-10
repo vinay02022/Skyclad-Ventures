@@ -10,12 +10,19 @@ import type { Logger } from "pino";
 
 import type { Database } from "../db/client.js";
 import type { AppConfig } from "./config.js";
+import { registerAdminRoutes } from "./modules/admin/routes.js";
 import { registerAuthHook } from "./modules/auth/hook.js";
 import { UsageLedgerRepository } from "./modules/budget/repository.js";
 import { DEFAULT_CACHE_CONFIG } from "./modules/cache/defaults.js";
 import { CacheRepository } from "./modules/cache/repository.js";
 import type { CacheConfig } from "./modules/cache/types.js";
 import { registerChatRoutes } from "./modules/chat/routes.js";
+import {
+  buildGatewayMetrics,
+  registerBreakerGauge,
+  type GatewayMetrics,
+} from "./modules/observability/gateway-metrics.js";
+import { registry as defaultMetricsRegistry } from "./modules/observability/metrics.js";
 import { registerObservabilityRoutes } from "./modules/observability/routes.js";
 import { RequestLogRepository } from "./modules/persistence/request-logs-repo.js";
 import { buildProviderRegistry } from "./modules/providers/factory.js";
@@ -64,10 +71,14 @@ export interface BuildAppOptions {
   // else. Production uses the default 5-minute TTL.
   cache?: CacheRepository;
   cacheConfig?: CacheConfig;
-  // Phase 8: request_logs writer (currently used by the streaming path).
-  // Tests inject the same repo they read back to assert request_logs
-  // rows materialized for partial-failure scenarios.
+  // Phase 8: request_logs writer. Tests inject the same repo they read
+  // back to assert request_logs rows materialized for every terminal.
   requestLogs?: RequestLogRepository;
+  // Phase 9: Prometheus counters/histograms. Tests inject a fresh
+  // registry+metrics so /metrics assertions don't see process-global
+  // pollution from sibling tests. Production lets buildApp build them
+  // against the shared default registry.
+  metrics?: GatewayMetrics;
 }
 
 // App builder is separated from the listener so tests can use `app.inject(...)`
@@ -86,6 +97,7 @@ export async function buildApp({
   cache,
   cacheConfig,
   requestLogs,
+  metrics,
 }: BuildAppOptions): Promise<FastifyInstance> {
   const app = Fastify({
     // Pino's Logger is structurally compatible with FastifyBaseLogger at runtime;
@@ -167,10 +179,22 @@ export async function buildApp({
     // and write for streaming or temperature > 0.
     const cacheRepo = cache ?? new CacheRepository(db);
     const cacheCfg = cacheConfig ?? DEFAULT_CACHE_CONFIG;
-    // Phase 8: request_logs writes for streaming outcomes. Non-streaming
-    // paths still log only via Pino; full request_logs coverage lands
-    // alongside the per-tenant Prometheus histograms.
+    // Phase 8/9: request_logs writes for every terminal (streaming and
+    // non-streaming alike). The recordRequestOutcome helper in
+    // observability/outcome.ts is the single call site that writes a
+    // row + updates Prometheus counters + emits the structured log line.
     const requestLogsRepo = requestLogs ?? new RequestLogRepository(db);
+    // Phase 9: gateway-level Prometheus metrics. We register the seven
+    // static series against the shared default registry and additionally
+    // register the per-provider breaker-state gauge whose collect()
+    // callback snapshots breakerReg at scrape time.
+    const gatewayMetrics = metrics ?? buildGatewayMetrics(defaultMetricsRegistry);
+    if (!metrics) {
+      // Only register the breaker gauge against the default registry when
+      // we own it; tests pass their own metrics+registry and wire the
+      // gauge themselves if they care.
+      registerBreakerGauge(defaultMetricsRegistry, breakerReg);
+    }
     await registerChatRoutes(app, {
       providers: providerRegistry,
       pricing: pricingRepo,
@@ -182,7 +206,18 @@ export async function buildApp({
       cache: cacheRepo,
       cacheConfig: cacheCfg,
       requestLogs: requestLogsRepo,
+      metrics: gatewayMetrics,
     });
+
+    // Phase 9: admin surface, mounted only when ADMIN_TOKEN is non-empty.
+    // Empty/unset = endpoint not registered, so a misconfigured deploy
+    // returns 404 to anyone who probes /admin/* — fail closed.
+    if (config.ADMIN_TOKEN) {
+      await registerAdminRoutes(app, {
+        usageLedger: ledgerRepo,
+        adminToken: config.ADMIN_TOKEN,
+      });
+    }
   }
 
   app.setNotFoundHandler((req, reply) => {

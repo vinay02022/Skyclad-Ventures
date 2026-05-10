@@ -5,22 +5,31 @@ import { requestLogs } from "../../../db/schema.js";
  * Status enum kept narrow on purpose. Each value is something an
  * on-call engineer can sort on and immediately understand:
  *
- *   - success                 the upstream answered cleanly
+ *   - success                 the upstream answered cleanly (or cache hit)
  *   - partial_failed          tokens reached the client, then upstream dropped
- *   - upstream_failed         all candidates failed before any token went out
- *   - all_providers_failed    same as above, used by the non-streaming path's
- *                             failover exhaustion (kept for future use)
+ *   - upstream_failed         the chosen provider failed (non-retryable, or
+ *                             override path) before any token went out
+ *   - all_providers_failed    every candidate failed retryably; failover
+ *                             exhausted
+ *   - rate_limited            tenant exceeded its per-minute bucket
+ *   - budget_exceeded         tenant exceeded its monthly USD budget
+ *   - invalid_request         body failed schema validation
+ *   - no_provider_available   router found zero eligible candidates
+ *                             (allowlist + breaker + enabled)
  *
- * Phase 8 only writes streaming outcomes. Non-streaming request_log
- * writes land in the observability phase alongside per-tenant /
- * per-provider Prometheus histograms; that work needs the same
- * insertion API so it makes sense to define it here once.
+ * Phase 8 only wrote streaming outcomes. Phase 9 widens this to every
+ * terminal in the chat handler so an evaluator can SELECT * FROM
+ * request_logs WHERE request_id = '...' and reconstruct what happened.
  */
 export type RequestLogStatus =
   | "success"
   | "partial_failed"
   | "upstream_failed"
-  | "all_providers_failed";
+  | "all_providers_failed"
+  | "rate_limited"
+  | "budget_exceeded"
+  | "invalid_request"
+  | "no_provider_available";
 
 export interface RequestLogEntry {
   requestId: string;

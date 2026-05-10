@@ -1,4 +1,4 @@
-import { and, eq, gte, sql } from "drizzle-orm";
+import { and, eq, gte, lt, sql } from "drizzle-orm";
 
 import type { Database } from "../../../db/client.js";
 import { usageLedger } from "../../../db/schema.js";
@@ -9,6 +9,15 @@ export interface UsageEntry {
   provider: string;
   model: string;
   requestId: string;
+  inputTokens: number;
+  outputTokens: number;
+  costUsd: number;
+}
+
+/** A single (provider, model) aggregate row for the admin usage endpoint. */
+export interface UsageBreakdownRow {
+  provider: string;
+  model: string;
   inputTokens: number;
   outputTokens: number;
   costUsd: number;
@@ -49,6 +58,48 @@ export class UsageLedgerRepository {
     // numeric() comes back as a string from node-postgres to preserve precision.
     // Convert at the boundary; downstream arithmetic uses regular numbers.
     return rows[0] ? Number(rows[0].total) : 0;
+  }
+
+  /**
+   * Per-(provider, model) aggregate over a half-open date range
+   * [from, to). Used by GET /admin/tenants/:id/usage. The (tenant_id,
+   * created_at) index makes this an indexed range scan + a HashAggregate
+   * on at most a handful of (provider, model) groups.
+   *
+   * Half-open range chosen so callers can pass to=tomorrow without
+   * worrying about whether they get today's last second. Same convention
+   * the standard library uses for date ranges.
+   */
+  async getUsageBreakdown(
+    tenantId: string,
+    from: Date,
+    to: Date,
+  ): Promise<UsageBreakdownRow[]> {
+    const rows = await this.db
+      .select({
+        provider: usageLedger.provider,
+        model: usageLedger.model,
+        inputTokens: sql<string>`COALESCE(SUM(${usageLedger.inputTokens}), 0)`,
+        outputTokens: sql<string>`COALESCE(SUM(${usageLedger.outputTokens}), 0)`,
+        costUsd: sql<string>`COALESCE(SUM(${usageLedger.costUsd}), 0)`,
+      })
+      .from(usageLedger)
+      .where(
+        and(
+          eq(usageLedger.tenantId, tenantId),
+          gte(usageLedger.createdAt, from),
+          lt(usageLedger.createdAt, to),
+        ),
+      )
+      .groupBy(usageLedger.provider, usageLedger.model);
+
+    return rows.map((r) => ({
+      provider: r.provider,
+      model: r.model,
+      inputTokens: Number(r.inputTokens),
+      outputTokens: Number(r.outputTokens),
+      costUsd: Number(r.costUsd),
+    }));
   }
 
   /**

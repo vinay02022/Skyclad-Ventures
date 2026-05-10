@@ -1,6 +1,8 @@
 import type { FastifyReply, FastifyRequest } from "fastify";
 
 import type { UsageLedgerRepository } from "../budget/repository.js";
+import type { GatewayMetrics } from "../observability/gateway-metrics.js";
+import { recordRequestOutcome } from "../observability/outcome.js";
 import type {
   RequestLogRepository,
   RequestLogStatus,
@@ -23,6 +25,7 @@ export interface StreamHandlerDeps {
   pricing: PricingRepository;
   usageLedger: UsageLedgerRepository;
   requestLogs: RequestLogRepository;
+  metrics: GatewayMetrics;
 }
 
 export interface StreamHandlerInput {
@@ -146,6 +149,7 @@ export async function streamChatCompletion(
           status: "success",
           provider: adapter.name,
           model: candidate.model,
+          routingReason: candidate.reason,
           inputTokens,
           outputTokens,
           startedAt: start,
@@ -165,6 +169,7 @@ export async function streamChatCompletion(
         status: "success",
         provider: adapter.name,
         model: candidate.model,
+        routingReason: candidate.reason,
         inputTokens,
         outputTokens,
         startedAt: start,
@@ -209,6 +214,7 @@ export async function streamChatCompletion(
           status: "partial_failed",
           provider: adapter.name,
           model: candidate.model,
+          routingReason: candidate.reason,
           inputTokens,
           outputTokens,
           startedAt: start,
@@ -245,6 +251,7 @@ export async function streamChatCompletion(
           status: "upstream_failed",
           provider: adapter.name,
           model: candidate.model,
+          routingReason: candidate.reason,
           inputTokens,
           outputTokens: 0,
           startedAt: start,
@@ -296,6 +303,7 @@ export async function streamChatCompletion(
     status: "all_providers_failed",
     provider: null,
     model: null,
+    routingReason: null,
     inputTokens,
     outputTokens: 0,
     startedAt: start,
@@ -323,6 +331,8 @@ interface TerminateInput {
   status: RequestLogStatus;
   provider: string | null;
   model: string | null;
+  /** RouteCandidate.reason for the candidate that was tried last. */
+  routingReason: string | null;
   inputTokens: number;
   outputTokens: number;
   startedAt: number;
@@ -331,6 +341,18 @@ interface TerminateInput {
   errorType?: string;
 }
 
+/**
+ * One terminal point per stream. Writes (in order):
+ *   1. usage_ledger row when we actually billed the tenant,
+ *   2. request_logs row + Prometheus counters + structured log line
+ *      (all via recordRequestOutcome so streaming and non-streaming
+ *      stay symmetric),
+ *   3. reply.raw.end() to release the socket.
+ *
+ * Ordering is load-bearing: Fastify's inject() resolves on socket close,
+ * so the writes have to be awaited BEFORE end(), or the test sees the
+ * response before request_logs is durable.
+ */
 async function terminate(reply: FastifyReply, args: TerminateInput): Promise<void> {
   const latencyMs = Date.now() - args.startedAt;
   let costUsd = 0;
@@ -351,10 +373,8 @@ async function terminate(reply: FastifyReply, args: TerminateInput): Promise<voi
   // Ledger write: success AND partial both bill the tenant. Spec says
   // partial responses still record whatever usage is known; the
   // assignment treats this as honest accounting (the upstream did real
-  // work that the gateway has to pay for). all_providers_failed and
-  // upstream_failed (no byte sent) get a zero-cost ledger row only if
-  // we have a provider attribution — otherwise we skip the ledger and
-  // log to request_logs only.
+  // work that the gateway has to pay for). upstream_failed and
+  // all_providers_failed (no byte sent) skip the ledger entirely.
   if (
     args.provider &&
     args.model &&
@@ -378,49 +398,29 @@ async function terminate(reply: FastifyReply, args: TerminateInput): Promise<voi
     }
   }
 
-  try {
-    await args.deps.requestLogs.insert({
+  await recordRequestOutcome(
+    {
+      requestLogs: args.deps.requestLogs,
+      metrics: args.deps.metrics,
+      log: args.req.log,
+    },
+    {
       requestId: args.req.id,
       tenantId: args.input.tenantId,
       provider: args.provider,
       model: args.model,
-      status: args.status,
-      errorType: args.errorType ?? null,
-      latencyMs,
+      modelClass: args.input.modelClass,
+      routePolicy: args.input.routePolicyName,
+      routingReason: args.routingReason,
       cacheHit: false,
       streaming: true,
+      latencyMs,
       inputTokens: args.inputTokens,
       outputTokens: args.outputTokens,
       costUsd: args.provider ? costUsd : null,
-    });
-  } catch (err) {
-    args.req.log.error(
-      { err, tenant_id: args.input.tenantId, request_id: args.req.id },
-      "stream: request_logs insert failed",
-    );
-  }
-
-  args.req.log.info(
-    {
-      tenant_id: args.input.tenantId,
-      streaming: true,
       status: args.status,
-      provider: args.provider,
-      model: args.model,
-      route_policy: args.input.routePolicyName,
-      candidate_count: args.input.candidatesConsidered,
-      fallback_used: args.fallbackUsed,
-      attempts: args.attempts,
-      latency_ms: latencyMs,
-      input_tokens: args.inputTokens,
-      output_tokens: args.outputTokens,
-      cost_usd: costUsd,
+      errorType: args.errorType ?? null,
     },
-    args.status === "success"
-      ? "stream completion ok"
-      : args.status === "partial_failed"
-        ? "stream completion partial"
-        : "stream completion failed before first byte",
   );
 
   // Close the socket only AFTER the bookkeeping is durable. See note above.

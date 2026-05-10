@@ -16,6 +16,13 @@ const EnvSchema = z.object({
     .default("postgres://gateway:gateway@localhost:5432/gateway"),
   OPENAI_API_KEY: z.string().optional().default(""),
   ANTHROPIC_API_KEY: z.string().optional().default(""),
+  // Admin endpoints (currently just GET /admin/tenants/:id/usage) are gated
+  // behind a single bearer token. Empty / unset means the admin surface is
+  // not mounted at all, so a misconfigured deploy fails closed: no
+  // accidentally-public usage endpoint. Production fix: rotate via secrets
+  // manager and split per-operator (we don't because the assignment scope
+  // is one operator).
+  ADMIN_TOKEN: z.string().optional().default(""),
 });
 
 export type AppConfig = z.infer<typeof EnvSchema>;

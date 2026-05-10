@@ -1,739 +1,532 @@
-# Skyclad LLM Gateway
+# Skyclad Ventures — Multi-tenant LLM gateway
 
-Multi-tenant LLM gateway built for the Skyclad Ventures Senior Backend Engineer
-assignment. This README evolves alongside the code; the full DESIGN.md follows
-the same trajectory.
+A small, production-shaped backend that fronts OpenAI and Anthropic
+behind one API. Each tenant has its own API key, monthly budget,
+rate limit, and provider allowlist. Requests go through a
+cost-optimized router with failover, retries with backoff, per-call
+timeouts, and a per-provider circuit breaker. SSE streaming and a
+deterministic Postgres-backed response cache are first-class.
+Structured logs and Prometheus metrics expose every interesting
+event. Mock providers ship in the box so you can run, test, and
+demo every flow with **zero external calls and zero spend**.
 
-## Stack
+The brief, the design tradeoffs, and the failure-mode reasoning live
+in [`DESIGN.md`](./DESIGN.md). This README is the operator's manual.
 
-- TypeScript on Node.js 20+
-- Fastify 5
-- PostgreSQL 16 + Drizzle ORM
-- Pino structured logs
-- `prom-client` Prometheus metrics
-- Vitest for tests
-- Docker Compose for local Postgres
+---
+
+## What is implemented
+
+- **Unified chat endpoint** — `POST /v1/chat/completions` with a
+  normalized request and response shape; `?stream=true` switches to
+  SSE without changing the URL.
+- **Two real providers** — `OpenAIProvider` (chat/completions API)
+  and `AnthropicProvider` (messages API), both behind the same
+  `ProviderAdapter` interface. Token usage prefers upstream-reported
+  figures and falls back to a chars/4 estimator when absent.
+- **Mock providers** — drop-in replacements wired by default
+  (`MOCK_PROVIDERS=true`). Same interface, deterministic output,
+  rich failure-injection knobs (header-based per-request and admin-
+  endpoint persistent — see below).
+- **Multi-tenant API keys** — Bearer-token auth backed by SHA-256
+  hashed keys in `api_keys`; resolution is one indexed lookup.
+- **Budget caps using a Postgres usage ledger** — every successful
+  call appends to `usage_ledger`; the budget gate sums the current
+  month's rows for that tenant and rejects with
+  `402 TENANT_BUDGET_EXCEEDED` when the cap is exceeded.
+- **Single-node in-memory token-bucket rate limiting** — per tenant,
+  config read from Postgres, bucket state in-process.
+  `429 TENANT_RATE_LIMITED` with `Retry-After`. Intentionally
+  single-node (see Known limitations).
+- **Provider allowlists** — per-tenant rows in
+  `tenant_provider_allowlists` filter routing candidates. Tenant_b's
+  openai-only allowlist exists in the seed data so you can prove
+  failover stays on the allowed list.
+- **Cost-optimized routing** — `CostOptimizedRoutingPolicy` picks
+  the cheapest healthy enabled candidate for the requested
+  `model_class` from the tenant's allowlist; `routing.fallback_used`
+  in the response tells you whether failover happened.
+- **Retry, timeout, and per-provider circuit breaker** —
+  `ResilientAdapter` wraps every adapter with bounded retries
+  (200ms / 500ms with jitter, 3 attempts), per-call timeout
+  (`PROVIDER_TIMEOUT_MS`, default 20s, synthesizes a retryable 504),
+  and a `CLOSED → OPEN → HALF_OPEN` breaker (5 failures in 60s →
+  open for 30s → one probe). The breaker registry is also the
+  router's health oracle; OPEN providers are skipped entirely.
+- **SSE streaming** — `text/event-stream`, one
+  `data: {"type":"token", ...}` per chunk, terminated by
+  `data: {"type":"done"}`. Failover before any byte is sent is
+  silent; failure after the first byte produces exactly one
+  `partial: true` error event.
+- **Partial streaming failure handling** — `request_logs` row gets
+  `status = "partial_failed"`, the tenant is billed for tokens
+  actually streamed (not the would-be full response), and the
+  socket closes cleanly.
+- **Postgres persistence using Drizzle ORM** — schemas, migrations,
+  and seed live in `db/`. Every durable surface (`tenants`,
+  `api_keys`, `provider_configs`, `tenant_provider_allowlists`,
+  `usage_ledger`, `request_logs`, `cache_entries`) is one table
+  inspectable via plain SQL.
+- **Structured logs** — Pino JSON. Every request line carries
+  `request_id`, `tenant_id`, `provider`, `model`, `model_class`,
+  `route_policy`, `routing_reason`, `cache_hit`, `streaming`,
+  `latency_ms`, `input_tokens`, `output_tokens`, `cost_usd`,
+  `status`, and `error_type` when relevant.
+- **Prometheus metrics** — `GET /metrics` exposes seven `gateway_*`
+  series: requests, errors, latency histogram, tokens, cost,
+  cache hits, and circuit-breaker state. Plus the prom-client
+  default Node metrics.
+- **Simple deterministic cache** — Postgres-backed
+  `cache_entries`, SHA-256 key over
+  `tenant_id + model_class + provider + model + normalized
+  messages + temperature + max_tokens`. Configurable TTL
+  (`CACHE_TTL_SECONDS`, default 300). Streaming and `temperature
+  > 0` bypass; cache hits never write to `usage_ledger` and never
+  bill the tenant.
+- **Eval-only admin helpers** (Phase 11) — three small endpoints
+  that make the assignment walkthrough one curl per scenario; see
+  the Failure-injection and Budget-exhaustion sections.
+
+---
+
+## What is intentionally NOT implemented
+
+- **Frontend / dashboard** — out of scope; observability is
+  Prometheus + JSON logs + an admin usage endpoint.
+- **Distributed rate limiting / Redis-backed shared counters** —
+  rate limit state is in-process and resets on restart. The
+  scaling cliff is honest and called out in DESIGN.md.
+- **Pre-request budget reservation** — accounting is post-call,
+  which under high concurrency can allow slight overspend within
+  one wall-clock second per tenant. Production fix is two-phase:
+  reserve estimated cost, reconcile with actual.
+- **Semantic cache** — only deterministic cache. No embeddings,
+  no nearest-neighbour lookup, no false-positive risk.
+- **Queue-based async jobs** — every request is synchronous. No
+  job runner, no retry queue, no inbox/outbox.
+- **Full production auth or RBAC** — admin endpoints share one
+  `ADMIN_TOKEN` Bearer secret; tenant API keys are hashed but not
+  rotated. No per-operator users, no audit trail, no SSO.
+- **Kubernetes deployment** — Docker Compose for local Postgres;
+  the gateway itself runs as a plain Node process.
+- **Tokenizer-accurate token counting** — `chars / 4` heuristic for
+  pre-call estimates; upstream-reported usage is preferred when
+  available.
+
+DESIGN.md goes deeper on each of these.
+
+---
 
 ## Quick start
 
 ```bash
+git clone <repo-url> skyclad-ventures
+cd skyclad-ventures
 cp .env.example .env
-docker compose up -d postgres
+docker compose up -d postgres        # postgres on :5432
 npm install
-npm run db:migrate     # create tenants, api_keys, usage_ledger, etc.
-npm run db:seed        # insert tenant_a / tenant_b and provider price table
-npm run dev
+npm run db:generate                  # idempotent; up-to-date if no schema changes
+npm run db:migrate                   # creates tables
+npm run db:seed                      # tenant_a / tenant_b + provider_configs
+npm run dev                          # listens on :8080
 ```
 
-The server boots on `http://localhost:8080`.
-
-> **Provider mode.** `MOCK_PROVIDERS=true` (the default) uses
-> deterministic in-process mock adapters for both `openai` and
-> `anthropic` so this Quick Start, every test, and every demo runs
-> with **zero external calls and zero spend**. Real adapters land in
-> the next section.
+Health check:
 
 ```bash
 curl http://localhost:8080/health
-curl http://localhost:8080/metrics
-
-# Authenticated identity check (tenant_a)
-curl -H "Authorization: Bearer sk_test_tenanta_demo_key_DO_NOT_USE_IN_PROD" \
-  http://localhost:8080/v1/me
-
-# tenant_b has a smaller budget and only OpenAI in its allowlist
-curl -H "Authorization: Bearer sk_test_tenantb_demo_key_DO_NOT_USE_IN_PROD" \
-  http://localhost:8080/v1/me
-
-# Chat completion (non-streaming). Phase 4: cost-optimized router picks the
-# cheapest provider in tenant_a's allowlist that serves the cheap class.
-# Returns body.routing = { policy, candidate_count, fallback_used, reason }.
-curl -X POST http://localhost:8080/v1/chat/completions \
-  -H "Authorization: Bearer sk_test_tenanta_demo_key_DO_NOT_USE_IN_PROD" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model_class": "cheap",
-    "messages": [{"role":"user","content":"hello there"}]
-  }'
-
-# Failover demo: fail the cheapest pick (openai) only, watch the router fall
-# through to anthropic. body.routing.fallback_used will be true.
-curl -X POST http://localhost:8080/v1/chat/completions \
-  -H "Authorization: Bearer sk_test_tenanta_demo_key_DO_NOT_USE_IN_PROD" \
-  -H "Content-Type: application/json" \
-  -H "x-skyclad-fail: 5xx" \
-  -H "x-skyclad-fail-provider: openai" \
-  -d '{ "model_class": "cheap", "messages": [{"role":"user","content":"hi"}] }'
-
-# Force EVERY upstream to fail. Endpoint returns 502 all_providers_failed
-# with the per-provider error trail and attempt count.
-curl -X POST http://localhost:8080/v1/chat/completions \
-  -H "Authorization: Bearer sk_test_tenanta_demo_key_DO_NOT_USE_IN_PROD" \
-  -H "Content-Type: application/json" \
-  -H "x-skyclad-fail: 5xx" \
-  -d '{ "model_class": "cheap", "messages": [{"role":"user","content":"hi"}] }'
-
-# Override the router (debug only): pin a provider/model. No failover applies.
-curl -X POST http://localhost:8080/v1/chat/completions \
-  -H "Authorization: Bearer sk_test_tenanta_demo_key_DO_NOT_USE_IN_PROD" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model_class": "premium",
-    "provider": "anthropic",
-    "messages": [{"role":"user","content":"explain SSL termination"}]
-  }'
-
-# Phase 5: trip the per-tenant rate limit. tenant_b is seeded at 10/min,
-# so the 11th call in the same minute returns 429 TENANT_RATE_LIMITED.
-for i in $(seq 1 11); do
-  curl -s -o /dev/null -w "%{http_code}\n" \
-    -X POST http://localhost:8080/v1/chat/completions \
-    -H "Authorization: Bearer sk_test_tenantb_demo_key_DO_NOT_USE_IN_PROD" \
-    -H "Content-Type: application/json" \
-    -d '{"model_class":"cheap","messages":[{"role":"user","content":"hi"}]}'
-done
-
-# Phase 5: trip the per-tenant budget. Inserting a synthetic ledger row that
-# exceeds tenant_b's $2 cap, then any next request returns 402 with the
-# spent_usd / budget_usd numbers.
-docker exec -it skyclad-postgres psql -U gateway -d gateway -c \
-  "INSERT INTO usage_ledger (tenant_id, provider, model, request_id, input_tokens, output_tokens, cost_usd) \
-   VALUES ('00000000-0000-0000-0000-00000000000b','openai','gpt-4o-mini','req-demo-overspend',1,1,2.5);"
-curl -X POST http://localhost:8080/v1/chat/completions \
-  -H "Authorization: Bearer sk_test_tenantb_demo_key_DO_NOT_USE_IN_PROD" \
-  -H "Content-Type: application/json" \
-  -d '{"model_class":"cheap","messages":[{"role":"user","content":"hi"}]}'
-
-# Phase 7: cache demo. Fire the same deterministic request twice and watch
-# the second response return cached:true, cost_usd:0, routing.policy:"cache".
-# Cached responses do not write to usage_ledger.
-curl -s -X POST http://localhost:8080/v1/chat/completions \
-  -H "Authorization: Bearer sk_test_tenanta_demo_key_DO_NOT_USE_IN_PROD" \
-  -H "Content-Type: application/json" \
-  -d '{"model_class":"cheap","messages":[{"role":"user","content":"what is 2 + 2"}]}' | jq '{cached, cost_usd, routing}'
-curl -s -X POST http://localhost:8080/v1/chat/completions \
-  -H "Authorization: Bearer sk_test_tenanta_demo_key_DO_NOT_USE_IN_PROD" \
-  -H "Content-Type: application/json" \
-  -d '{"model_class":"cheap","messages":[{"role":"user","content":"what is 2 + 2"}]}' | jq '{cached, cost_usd, routing}'
-
-# Inspect the cache
-docker exec -it skyclad-postgres psql -U gateway -d gateway -c \
-  "SELECT tenant_id, substring(cache_key for 16) AS cache_key_prefix, expires_at FROM cache_entries;"
-
-# temperature > 0 opts out — replay never hits cache
-curl -s -X POST http://localhost:8080/v1/chat/completions \
-  -H "Authorization: Bearer sk_test_tenanta_demo_key_DO_NOT_USE_IN_PROD" \
-  -H "Content-Type: application/json" \
-  -d '{"model_class":"cheap","temperature":0.7,"messages":[{"role":"user","content":"hi"}]}' | jq '.cached'
-
-# Phase 8: SSE streaming. Returns text/event-stream; client sees one
-# `data: {"type":"token","content":"..."}` line per chunk, finishing with
-# `data: {"type":"done"}`. Use `curl -N` to disable buffering.
-curl -N -X POST http://localhost:8080/v1/chat/completions \
-  -H "Authorization: Bearer sk_test_tenanta_demo_key_DO_NOT_USE_IN_PROD" \
-  -H "Content-Type: application/json" \
-  -d '{"model_class":"cheap","stream":true,"messages":[{"role":"user","content":"tell me a joke"}]}'
-
-# Streaming failover: openai pre-stream-drops, anthropic answers. The client
-# sees only anthropic's tokens followed by `done` -- no error event.
-curl -N -X POST http://localhost:8080/v1/chat/completions \
-  -H "Authorization: Bearer sk_test_tenanta_demo_key_DO_NOT_USE_IN_PROD" \
-  -H "Content-Type: application/json" \
-  -H "x-skyclad-fail: pre-stream-drop" \
-  -H "x-skyclad-fail-provider: openai" \
-  -d '{"model_class":"cheap","stream":true,"messages":[{"role":"user","content":"hi"}]}'
-
-# Partial-stream failure: openai sends 2 tokens then drops. Client sees those
-# 2 tokens followed by ONE error event with `partial:true`. NEVER fails over
-# (the client is already committed to the partial response).
-curl -N -X POST http://localhost:8080/v1/chat/completions \
-  -H "Authorization: Bearer sk_test_tenanta_demo_key_DO_NOT_USE_IN_PROD" \
-  -H "Content-Type: application/json" \
-  -H "x-skyclad-fail: stream-drop" \
-  -H "x-skyclad-fail-after: 2" \
-  -H "x-skyclad-fail-provider: openai" \
-  -d '{"model_class":"cheap","stream":true,"messages":[{"role":"user","content":"hi"}]}'
-
-# Inspect what got logged for the partial failure
-docker exec -it skyclad-postgres psql -U gateway -d gateway -c \
-  "SELECT request_id, status, streaming, provider, output_tokens, error_type FROM request_logs ORDER BY created_at DESC LIMIT 5;"
-
-# Phase 9: Prometheus metrics. The seven gateway_* series appear in the
-# output once they have been incremented at least once by a request.
-curl -s http://localhost:8080/metrics | grep '^gateway_' | head -20
-
-# Phase 9: per-tenant usage summary. Only mounted when ADMIN_TOKEN is set
-# in the environment (see .env.example). Unset = 404 to anyone.
-export ADMIN_TOKEN="local-dev-admin-token"   # restart the server after setting
-curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
-  "http://localhost:8080/admin/tenants/00000000-0000-0000-0000-00000000000a/usage?from=2026-05-01&to=2026-05-31" | jq .
 ```
 
-### Phase 11 — Evaluator walkthrough (8 steps)
+Full clone-to-running on a warm machine: under 5 minutes. Cold
+(needs Docker pulls): 10–15 minutes depending on bandwidth.
 
-Same 8-step demo a reviewer is likely to run, but driven by the
-**eval-only admin helpers** instead of per-request `x-skyclad-fail`
-headers. The whole script is copy-pasteable. Set the admin token first
-(any non-empty string works locally):
+---
+
+## Running tests
 
 ```bash
-export ADMIN_TOKEN="local-dev-admin-token"   # restart the server after setting
-ADMIN="Authorization: Bearer $ADMIN_TOKEN"
+npm test                             # full suite, 171 tests across 16 files
+npx vitest run tests/chat.test.ts    # single file
+```
+
+The suite uses a separate `gateway_test` database which the setup
+auto-creates on first run. DB-dependent suites skip gracefully (with
+a clear console message) if Postgres is unreachable, so `npm test`
+never produces spurious failures on a fresh clone with the container
+not yet started.
+
+---
+
+## Environment variables
+
+Defaults are in `.env.example`. Only `DATABASE_URL` is strictly
+required; everything else has a sensible default.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `DATABASE_URL` | `postgres://gateway:gateway@localhost:5432/gateway` | Primary Postgres connection. Matches the Compose file. |
+| `MOCK_PROVIDERS` | `true` | When `true`, both providers are deterministic in-process mocks (zero spend). When `false`, each provider goes real if its API key is set; missing keys fall back to mock per-provider with a logged warning. |
+| `OPENAI_API_KEY` | (empty) | Required only for live OpenAI calls. |
+| `ANTHROPIC_API_KEY` | (empty) | Required only for live Anthropic calls. |
+| `ADMIN_TOKEN` | (empty) | When set, mounts `/admin/*` (read-only usage endpoint + Phase 11 eval-only helpers) behind Bearer auth. When unset, the entire admin surface is unmounted (404 to anyone — fail closed). |
+| `CACHE_TTL_SECONDS` | `300` | TTL for the deterministic response cache. Set lower for cache-expiry demos. |
+| `PROVIDER_TIMEOUT_MS` | `20000` | Per-call upstream timeout. Below this the timeout wrapper synthesizes a retryable 504. |
+| `PORT` | `8080` | HTTP port. |
+| `LOG_LEVEL` | `info` | `fatal | error | warn | info | debug | trace | silent`. |
+
+---
+
+## API examples (curl)
+
+Set these once for the rest of this README:
+
+```bash
 A="Authorization: Bearer sk_test_tenanta_demo_key_DO_NOT_USE_IN_PROD"
 B="Authorization: Bearer sk_test_tenantb_demo_key_DO_NOT_USE_IN_PROD"
 JSON="Content-Type: application/json"
 URL=http://localhost:8080
 ```
 
-```bash
-# 1. Normal tenant request (router picks the cheapest allowed provider).
-curl -s -X POST $URL/v1/chat/completions -H "$A" -H "$JSON" \
-  -d '{"model_class":"cheap","messages":[{"role":"user","content":"hello"}]}' | jq '{provider, model, cost_usd, routing}'
+### Non-streaming request (tenant_a)
 
-# 2. Streaming request (text/event-stream; one `token` per chunk + final `done`).
+tenant_a's allowlist is `[openai, anthropic]`; the cost-optimized
+router picks `gpt-4o-mini` for the `cheap` class.
+
+```bash
+curl -s -X POST $URL/v1/chat/completions -H "$A" -H "$JSON" \
+  -d '{"model_class":"cheap","messages":[{"role":"user","content":"hello"}]}' | jq .
+```
+
+Response (excerpt):
+
+```json
+{
+  "request_id": "...",
+  "provider": "openai",
+  "model": "gpt-4o-mini",
+  "message": { "role": "assistant", "content": "..." },
+  "usage": { "input_tokens": 4, "output_tokens": 21 },
+  "cost_usd": 0.000013,
+  "cached": false,
+  "routing": {
+    "policy": "cost_optimized",
+    "candidate_count": 2,
+    "fallback_used": false,
+    "reason": "cheapest healthy candidate"
+  }
+}
+```
+
+### Streaming request (tenant_a)
+
+```bash
 curl -N -X POST $URL/v1/chat/completions -H "$A" -H "$JSON" \
   -d '{"model_class":"cheap","stream":true,"messages":[{"role":"user","content":"tell me a joke"}]}'
+```
 
-# 3. Force OpenAI failure (persistent until cleared — no more headers needed).
-curl -s -X POST $URL/admin/mock-providers/openai/failure-mode -H "$ADMIN" -H "$JSON" \
-  -d '{"mode":"fail_5xx"}' | jq .
+Wire format:
 
-# 4. Show Anthropic fallback. tenant_a allows both providers, so the router
-#    skips the broken openai and answers with anthropic. routing.fallback_used = true.
-curl -s -X POST $URL/v1/chat/completions -H "$A" -H "$JSON" \
-  -d '{"model_class":"cheap","messages":[{"role":"user","content":"now answer me"}]}' \
-  | jq '{provider, routing}'
+```
+data: {"type":"token","content":"[mock-openai]"}
 
-#    Reset openai before the next steps so it's not a confounder.
-curl -s -X POST $URL/admin/mock-providers/openai/failure-mode -H "$ADMIN" -H "$JSON" \
-  -d '{"mode":"normal"}' > /dev/null
+data: {"type":"token","content":" tell me"}
 
-# 5. Exhaust Tenant A budget (drop its cap to nearly $0; next call returns 402).
-curl -s -X POST $URL/admin/tenants/00000000-0000-0000-0000-00000000000a/set-budget \
-  -H "$ADMIN" -H "$JSON" -d '{"monthly_budget_usd":0.0001}' | jq .
-curl -s -X POST $URL/v1/chat/completions -H "$A" -H "$JSON" \
-  -d '{"model_class":"cheap","messages":[{"role":"user","content":"hi"}]}' | jq .
+...
 
-# 6. Show Tenant B still works (proves per-tenant isolation — A's failure
-#    does not affect B). tenant_b's $2 budget is untouched.
+data: {"type":"done"}
+```
+
+### Tenant B request (different tenant, different cap, different allowlist)
+
+tenant_b allows only `openai` and is rate-limited at 10/min.
+
+```bash
 curl -s -X POST $URL/v1/chat/completions -H "$B" -H "$JSON" \
   -d '{"model_class":"cheap","messages":[{"role":"user","content":"hi"}]}' | jq '{provider, cost_usd}'
+```
 
-#    Restore tenant_a's seeded budget for the next run.
-curl -s -X POST $URL/admin/tenants/00000000-0000-0000-0000-00000000000a/set-budget \
+### Identity check (either tenant)
+
+```bash
+curl -s -H "$A" $URL/v1/me | jq .
+```
+
+### Override the router (debug; pin a provider/model)
+
+No failover applies on this path.
+
+```bash
+curl -s -X POST $URL/v1/chat/completions -H "$A" -H "$JSON" \
+  -d '{
+    "model_class": "premium",
+    "provider": "anthropic",
+    "messages": [{"role":"user","content":"explain SSL termination"}]
+  }' | jq '{provider, model, cost_usd}'
+```
+
+---
+
+## Failure injection
+
+Two ways to drive failures, both for **mock providers only**.
+
+### Per-request, header-based (no admin token needed)
+
+Useful for one-off curl tests. Headers are surgical: pin the
+failure to one provider so the other still answers.
+
+```bash
+# Force openai to 5xx for THIS request only — anthropic answers,
+# routing.fallback_used = true.
+curl -s -X POST $URL/v1/chat/completions -H "$A" -H "$JSON" \
+  -H "x-skyclad-fail: 5xx" -H "x-skyclad-fail-provider: openai" \
+  -d '{"model_class":"cheap","messages":[{"role":"user","content":"hi"}]}' \
+  | jq '{provider, routing}'
+```
+
+| Header | Values | Effect |
+|---|---|---|
+| `x-skyclad-fail` | `5xx`, `rate-limit`, `timeout`, `pre-stream-drop`, `stream-drop` | The failure mode. |
+| `x-skyclad-fail-after` | integer | For `stream-drop`: chunks before the drop. |
+| `x-skyclad-fail-delay` | integer (ms) | Optional artificial latency before the failing call. |
+| `x-skyclad-fail-provider` | `openai` / `anthropic` | Limits the failure to one provider — essential for proving failover. |
+
+### Persistent, admin-endpoint-based (requires `ADMIN_TOKEN`)
+
+Useful for multi-step demos where you don't want to re-attach the
+header to every request. State is process-local and clears on
+restart by design.
+
+```bash
+# Set ADMIN_TOKEN in .env (any non-empty string) and restart the server.
+ADMIN="Authorization: Bearer $ADMIN_TOKEN"
+
+# Force OpenAI to return 5xx on every subsequent call.
+curl -s -X POST $URL/admin/mock-providers/openai/failure-mode \
+  -H "$ADMIN" -H "$JSON" -d '{"mode":"fail_5xx"}' | jq .
+
+# Now any tenant_a request goes via anthropic with fallback_used:true.
+curl -s -X POST $URL/v1/chat/completions -H "$A" -H "$JSON" \
+  -d '{"model_class":"cheap","messages":[{"role":"user","content":"hi"}]}' \
+  | jq '{provider, routing}'
+
+# Force a timeout (mock sleeps 60s; the resilience wrapper races
+# PROVIDER_TIMEOUT_MS and synthesizes a 504).
+curl -s -X POST $URL/admin/mock-providers/openai/failure-mode \
+  -H "$ADMIN" -H "$JSON" -d '{"mode":"timeout"}' | jq .
+
+# Force a streaming drop after 2 chunks. The next streaming request
+# emits two token events, then exactly one error event with
+# partial:true, and writes request_logs.status='partial_failed'.
+curl -s -X POST $URL/admin/mock-providers/openai/failure-mode \
+  -H "$ADMIN" -H "$JSON" -d '{"mode":"stream_drop_after_chunks","chunks":2}' | jq .
+
+# Reset openai back to normal.
+curl -s -X POST $URL/admin/mock-providers/openai/failure-mode \
+  -H "$ADMIN" -H "$JSON" -d '{"mode":"normal"}' | jq .
+```
+
+Per-request `x-skyclad-fail` headers always win over the persistent
+mode set by these endpoints.
+
+---
+
+## Budget exhaustion demo
+
+Tenant budgets are per-month, sourced from `usage_ledger`. The
+gate runs on every request (it's one indexed `SUM(cost_usd)` over
+the current month).
+
+```bash
+ADMIN="Authorization: Bearer $ADMIN_TOKEN"
+TENANT_A=00000000-0000-0000-0000-00000000000a
+
+# 1. Drop tenant_a's monthly cap to nearly zero.
+curl -s -X POST $URL/admin/tenants/$TENANT_A/set-budget \
+  -H "$ADMIN" -H "$JSON" -d '{"monthly_budget_usd":0.0001}' | jq .
+
+# 2. Send one request as tenant_a. The auth hook re-reads the tenant
+#    on every call, so the new cap applies immediately. Expect 402.
+curl -s -w "\nHTTP %{http_code}\n" -X POST $URL/v1/chat/completions \
+  -H "$A" -H "$JSON" \
+  -d '{"model_class":"cheap","messages":[{"role":"user","content":"hi"}]}'
+
+# 3. Tenant B is untouched — different tenant_id, different budget row.
+#    Prove isolation: tenant_b still gets 200.
+curl -s -w "\nHTTP %{http_code}\n" -X POST $URL/v1/chat/completions \
+  -H "$B" -H "$JSON" \
+  -d '{"model_class":"cheap","messages":[{"role":"user","content":"hi"}]}'
+
+# 4. Cleanup: restore tenant_a's seeded $10 cap and clear its ledger.
+curl -s -X POST $URL/admin/tenants/$TENANT_A/set-budget \
   -H "$ADMIN" -H "$JSON" -d '{"monthly_budget_usd":10}' > /dev/null
-#    (And/or wipe the ledger entirely.)
-curl -s -X POST $URL/admin/tenants/00000000-0000-0000-0000-00000000000a/reset-usage \
-  -H "$ADMIN" | jq .
+curl -s -X POST $URL/admin/tenants/$TENANT_A/reset-usage -H "$ADMIN" | jq .
+```
 
-# 7. Query /metrics — Prometheus exposition. Filter to gateway_* series.
+Step 2 returns:
+
+```json
+{
+  "error": "TENANT_BUDGET_EXCEEDED",
+  "tenant_id": "00000000-0000-0000-0000-00000000000a",
+  "spent_usd": 0.000013,
+  "budget_usd": 0.0001,
+  ...
+}
+```
+
+---
+
+## Rate-limit demo
+
+Rate limiting is a **single-node in-memory token bucket** per
+tenant. The bucket capacity comes from `tenants.rate_limit_per_minute`
+in Postgres; the bucket state itself lives in-process and resets on
+restart. Tenant_b is seeded at 10/min, so the 11th request inside one
+minute returns `429 TENANT_RATE_LIMITED` with a `Retry-After` header.
+
+```bash
+# Burst 11 requests; expect ten 200s then one 429.
+for ($i=1; $i -le 11; $i++) {
+  curl -s -o /dev/null -w "%{http_code}`n" \
+    -X POST $URL/v1/chat/completions -H "$B" -H "$JSON" \
+    -d '{"model_class":"cheap","messages":[{"role":"user","content":"hi"}]}'
+}
+```
+
+(POSIX shell: `for i in $(seq 1 11); do ... ; done` instead.)
+
+This is intentionally single-node for assignment scope. The right
+production swap is a Redis token bucket (`INCR` + `EXPIRE`, or a
+Lua script that returns `tokens_left + retry_after_ms` atomically).
+The interface in `src/modules/ratelimit/rate-limiter.ts` is already
+shaped to allow swapping the implementation without touching
+callers. See DESIGN.md for the scaling cliff.
+
+---
+
+## Metrics and logs
+
+### `/metrics`
+
+Standard Prometheus exposition. The seven gateway-level series are
+named with a `gateway_` prefix:
+
+```bash
 curl -s $URL/metrics | grep '^gateway_' | head -30
+```
 
-# 8. Query tenant usage summary (per-provider, per-model, per-token-type).
-curl -s -H "$ADMIN" \
+| Metric | Type | Labels | What it tells you |
+|---|---|---|---|
+| `gateway_requests_total` | counter | `tenant_id, provider, model, status` | Per-tenant traffic and outcome breakdown. |
+| `gateway_errors_total` | counter | `tenant_id, provider, error_type` | Errors classified by upstream cause. |
+| `gateway_latency_ms` | histogram | `provider, model` | End-to-end provider latency. |
+| `gateway_tokens_total` | counter | `tenant_id, provider, model, token_type` | Input vs output tokens per tenant. |
+| `gateway_cost_usd_total` | counter | `tenant_id, provider, model` | Spend; matches `usage_ledger` over the same window. |
+| `gateway_cache_hits_total` | counter | `tenant_id` | Cache effectiveness. |
+| `gateway_provider_circuit_state` | gauge | `provider, state` | Real-time breaker state, sampled at scrape. |
+
+### Per-tenant usage summary
+
+`/admin/tenants/:tenantId/usage` aggregates `usage_ledger` over a
+date range. Requires `ADMIN_TOKEN`.
+
+```bash
+curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
   "$URL/admin/tenants/00000000-0000-0000-0000-00000000000a/usage?from=2026-05-01&to=2026-05-31" | jq .
 ```
 
-### Eval helper endpoints (Phase 11)
-
-Three endpoints exist for **local evaluation only**. They share the
-same `ADMIN_TOKEN` Bearer gate as `/admin/tenants/:id/usage` and every
-response carries `x-skyclad-eval-only: true` so it's obvious in logs
-when one was called. They are **not** production admin APIs — see
-DESIGN.md for the gaps (no per-operator identity, no audit trail, no
-rate-limit on the admin surface).
-
-| Method + path | Body | Effect |
-|---|---|---|
-| `POST /admin/mock-providers/:provider/failure-mode` | `{"mode":"normal"}` | Clears any persistent failure on that mock. |
-| `POST /admin/mock-providers/:provider/failure-mode` | `{"mode":"fail_5xx"}` | Every subsequent call to that mock throws ProviderError(500, retryable). |
-| `POST /admin/mock-providers/:provider/failure-mode` | `{"mode":"timeout"}` | Mock sleeps 60s; the resilient wrapper races the configured `timeoutMs` and synthesizes a 504. |
-| `POST /admin/mock-providers/:provider/failure-mode` | `{"mode":"stream_drop_before_first_token"}` | Streaming calls throw before any chunk. Safe to fail over. |
-| `POST /admin/mock-providers/:provider/failure-mode` | `{"mode":"stream_drop_after_chunks","chunks":2}` | Streaming calls emit N chunks, then throw. Not retried — produces a `partial:true` SSE error event. |
-| `POST /admin/tenants/:tenantId/reset-usage` | _(none)_ | Deletes every `usage_ledger` row for that tenant. Returns `{rows_deleted}`. |
-| `POST /admin/tenants/:tenantId/set-budget` | `{"monthly_budget_usd":25.0}` | Updates `tenants.monthly_budget_usd`. The auth hook re-reads the tenant on every call, so the change applies on the very next request. |
-
-Notes:
-
-- `:provider` is restricted to the registered mock names: `openai`,
-  `anthropic`. Anything else returns 400.
-- `x-skyclad-fail` headers (per-request injection) still take
-  precedence over the persistent mode set by these endpoints. The
-  store is the "until I clear it" mode for scenario walkthroughs;
-  headers are the "just this one request" mode.
-- Settings are **process-local** and clear on restart by design — we
-  don't want a debug knob persisting through a deploy.
-- In live mode (`MOCK_PROVIDERS=false`) the failure-mode endpoint
-  still accepts the call but the real adapters never read the store,
-  so the setting has no effect. Demonstrate failures with the mocks.
-
-### Running with real OpenAI / Anthropic providers (Phase 10)
-
-Mock mode (the default) is the right choice for everything except a
-demo against a live model. To switch on the real adapters:
-
-```bash
-# 1. Provide one or both API keys.
-export OPENAI_API_KEY=sk-...
-export ANTHROPIC_API_KEY=sk-ant-...
-
-# 2. Flip the mode flag.
-export MOCK_PROVIDERS=false
-
-# 3. Restart the server.
-npm run dev
+```json
+{
+  "tenant_id": "00000000-0000-0000-0000-00000000000a",
+  "from": "2026-05-01",
+  "to": "2026-05-31",
+  "total_cost_usd": 0.001482,
+  "total_input_tokens": 1240,
+  "total_output_tokens": 873,
+  "by_provider": { "openai": { ... }, "anthropic": { ... } },
+  "by_model":    { "openai/gpt-4o-mini": { ... }, ... }
+}
 ```
 
-Behaviour:
+### Example log line
 
-- `MOCK_PROVIDERS=false` + both keys set → both upstreams are real.
-- `MOCK_PROVIDERS=false` + one key missing → that one provider falls
-  back to mock with a logged warning; the other is real. Lets you
-  test the OpenAI path without an Anthropic key (or vice versa).
-- `MOCK_PROVIDERS=false` + both keys missing → both fall back to mock
-  with two warnings. The server still boots; you'll see warnings in
-  the logs telling you the mode was a no-op.
-- `MOCK_PROVIDERS=true` (or unset) → always mock, regardless of keys.
-  This is the safe default and the value the test suite uses.
+A successful chat request emits one structured line that contains
+everything you need for triage:
 
-Both real adapters implement the **same `ProviderAdapter` interface**
-as the mocks. Routing, failover, the resilience wrapper, the cache,
-the streaming handler, `request_logs`, the Prometheus metrics, and
-the admin usage endpoint all work identically in either mode — the
-only thing that changes is whose servers handle the actual generation.
-
-### Avoiding provider spend during evaluation
-
-The default flow already avoids spend:
-
-- `npm test` always runs with mocks. The 156-test suite never makes a
-  network call to a real provider; the real-adapter tests inject a
-  fake `fetch` so request shape, error mapping, and SSE parsing are
-  all verified against constructed `Response` objects.
-- `npm run dev` with `.env.example` copied verbatim runs in mock mode
-  even if you've exported real `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`
-  in your shell — `MOCK_PROVIDERS=true` overrides them.
-- The seeded provider price table is the source of truth for cost
-  calculations regardless of mode, so dashboards and billing math
-  give the same answer in mock mode and real mode.
-
-If you want to demo against real upstreams without leaving the gateway
-running on real keys: `unset MOCK_PROVIDERS` (or set it back to
-`true`) when you're done; the server picks the new value up on
-restart.
-
-### Failure injection knobs (mock providers only)
-
-| Header | Value | Effect |
-|---|---|---|
-| `x-skyclad-fail` | `5xx` | Adapter throws ProviderError(500, retryable). Resilient wrapper retries up to 3 times before bubbling. |
-| `x-skyclad-fail` | `rate-limit` | Adapter throws ProviderError(429, retryable). Same retry path. |
-| `x-skyclad-fail` | `timeout` | Adapter sleeps 60s. Resilient wrapper races against the configured `timeoutMs` (default 20s) and synthesizes ProviderError(504, retryable). |
-| `x-skyclad-fail` | `pre-stream-drop` | `stream()` throws before any chunk. Safe to failover. |
-| `x-skyclad-fail` | `stream-drop` | `stream()` emits N chunks, then throws. Not retryable. |
-| `x-skyclad-fail-after` | integer | For `stream-drop`: number of chunks before the failure. |
-| `x-skyclad-fail-delay` | integer (ms) | Optional artificial latency before the (failing) call. |
-| `x-skyclad-fail-provider` | provider name | Limit the failure to a single provider — essential for proving failover (`x-skyclad-fail-provider: openai`). |
-
-## Tests
-
-```bash
-npm test
+```json
+{
+  "level":"info",
+  "time":"2026-05-10T14:21:09.123Z",
+  "request_id":"r-9f3b...",
+  "tenant_id":"00000000-0000-0000-0000-00000000000a",
+  "provider":"anthropic",
+  "model":"claude-3-haiku-20240307",
+  "model_class":"cheap",
+  "route_policy":"cost_optimized",
+  "routing_reason":"cheapest healthy candidate",
+  "cache_hit":false,
+  "streaming":false,
+  "latency_ms":312,
+  "input_tokens":4,
+  "output_tokens":21,
+  "cost_usd":0.000027,
+  "status":"success",
+  "msg":"chat request completed"
+}
 ```
 
-The test suite uses a separate database (`gateway_test`) which the setup
-auto-creates on first run. Tests that need Postgres skip gracefully with a
-clear console message if the DB is unreachable, so `npm test` never produces
-spurious failures on a fresh clone.
+For a partial streaming failure, `status` becomes `partial_failed`
+and `error_type` is populated; `output_tokens` is the count
+actually streamed (the tenant is billed for what was sent).
 
-| Suite | Covers |
-|---|---|
-| `tests/health.test.ts` | `/health` returns ok, request id propagation, `/metrics` returns Prometheus exposition format. |
-| `tests/auth.test.ts` | Missing / unknown / valid bearer tokens, two seeded tenants, `/health` and `/metrics` are public. |
-| `tests/tenants.test.ts` | `TenantRepository` lookup by hashed API key, budget config read, allowlist read, tenant-A vs tenant-B isolation. |
-| `tests/providers.test.ts` | Mock provider adapters: name, model resolution, `complete`, `stream`, all five failure modes, token estimation, health. |
-| `tests/chat.test.ts` | `POST /v1/chat/completions` end-to-end: auth, validation, normalized response shape, override path (pin provider), router-driven path, **failover** when first provider fails, 502 all-providers-failed, allowlist-induced 503 for tenant_b, 501 for stream:true. |
-| `tests/routing.test.ts` | `CostOptimizedRoutingPolicy` unit tests with in-memory fakes: cheapest-wins, allowlist filter, missing-adapter filter, unhealthy-provider filter, returns null when nothing eligible, and the disabled-row contract (filtered in SQL). |
-| `tests/budget.test.ts` | `UsageLedgerRepository` round-trip + tenant isolation; chat endpoint writes a `usage_ledger` row on success; `402 TENANT_BUDGET_EXCEEDED` once the SUM crosses `monthly_budget_usd`; tenant_a still succeeds while tenant_b is over budget. |
-| `tests/ratelimit.test.ts` | `TokenBucket` unit (drain, refill, retryAfterMs, reconfigure clamp), `InMemoryRateLimiter` per-tenant isolation + reconfigure + `reset()`, integration: tenant_b at 10/min returns `429 TENANT_RATE_LIMITED` on burst 11, `Retry-After` header set, tenant_a unaffected. |
-| `tests/resilience.test.ts` | `ResilientAdapter` retries transient errors and succeeds on a later attempt; does NOT retry 4xx; exhausts retries and bubbles. `withTimeout` synthesizes a 504 retryable error. `CircuitBreaker` state machine: opens after threshold, transitions OPEN→HALF_OPEN after cooldown, lets exactly one probe through, closes on probe success or reopens on probe failure. `CircuitBreakerRegistry` as `ProviderHealthOracle` reports OPEN providers unhealthy and recovers after cooldown. End-to-end failover when one provider's circuit is OPEN. |
-| `tests/cache.test.ts` | `buildCacheKey` is deterministic, includes `tenant_id`, includes `provider`/`model`, ignores extra message fields, and returns 64-char sha256 hex. `isCacheable` rejects streaming and `temperature > 0`. `CacheRepository` set/get round-trips, isolates tenants on the same key, upserts on conflict, returns null for expired rows. End-to-end: same request hits cache on second call (`cached:true`, `cost_usd:0`, `routing.policy:"cache"`); cache hit writes no `usage_ledger` row; tenant_b doesn't see tenant_a's cache; streaming bypasses cache; `temperature > 0` bypasses cache; expired row causes a real provider call. |
-| `tests/streaming.test.ts` | `formatSSEEvent` emits the right wire format for token/done/error. End-to-end SSE: `text/event-stream` headers; multiple `token` events followed by exactly one `done`; ledger and `request_logs` rows written on success (`streaming=true`, `status=success`, `cache_hit=false`); cache fully bypassed for streaming. Failover before first byte succeeds silently (anthropic answers when openai pre-drops). After-N-tokens drop emits exactly one `error` event with `partial:true` and NO `done` after it; partial response is logged with `status=partial_failed` and tenant is billed for what was actually sent. All-providers-pre-drop emits one `error` with `partial:false` and logs `status=all_providers_failed`. Tenant isolation under concurrent streams. |
-| `tests/observability.test.ts` | Successful non-streaming request writes a complete `request_logs` row (`tenant_id`, `provider`, `model`, `status=success`, `latency_ms`, `input_tokens`, `output_tokens`, `cost_usd`, `cache_hit=false`, `streaming=false`). Forced provider failure writes a row with `status=all_providers_failed` and `error_type` populated, AND increments `gateway_errors_total`. The seven gateway-level Prometheus series are present in the registry serialization, with `tenant_id` / `provider` / `model` / `status` labels populated and tokens partitioned by `token_type`. |
-| `tests/admin-usage.test.ts` | `GET /admin/tenants/:tenantId/usage` rejects no-token (401) and wrong-token (401), validates date params (400 on malformed or `from > to`), returns zero totals (not 404) for empty ranges, aggregates `usage_ledger` rows correctly into `total_*` / `by_provider` / `by_model`, and is fully tenant-isolated (tenant_b's response never carries tenant_a's numbers). |
-| `tests/admin-eval-helpers.test.ts` | Phase-11 eval-only admin endpoints. Auth gate rejects no-token / wrong-token (401) on all three. `POST /admin/mock-providers/:provider/failure-mode` toggles persistent mock behaviour across requests (baseline 200, force `fail_5xx` → 5xx, clear → 200 again), forced 5xx on openai falls over to anthropic for tenant_a (`routing.fallback_used:true`), `stream_drop_after_chunks` produces a partial `error` SSE event with `partial:true` and writes `request_logs.status='partial_failed'`; rejects unknown provider names (400) and missing `chunks` (400). `POST /admin/tenants/:id/reset-usage` deletes every ledger row for one tenant (returns `rows_deleted`), is a no-op on empty ledgers, and never touches other tenants. `POST /admin/tenants/:id/set-budget` lowers the cap and the next request returns `402 TENANT_BUDGET_EXCEEDED`; raising the cap unblocks the same request; 404 on unknown tenant; 400 on negative budget. |
-| `tests/providers-real.test.ts` | Pure-function coverage for the SSE parser (chunk-boundary mid-line, `\r\n` endings, comment lines, multi-line `data:`, EOF flush) and `mapHttpStatusToProviderError` (400/401/422 → not retryable, 429 → retryable, 5xx → retryable, transport AbortError → 504, other transport → 503). `OpenAIProvider`: rejects empty key; `resolveDefaultModel` matches the seeded rows; `complete()` sends the right URL/headers/body and parses the response; missing `usage` falls back to the chars/4 estimator; all four error classes map correctly; `stream()` opts in via `stream_options.include_usage` and yields delta + done with upstream-reported usage; pre-stream 5xx maps to retryable. Same coverage for `AnthropicProvider` plus `hoistSystemMessages` (system role extracted to top-level), multi-text-block concatenation, and the named-event SSE shape (`message_start`, `content_block_delta`, `message_delta`, `message_stop`). |
-| `tests/factory.test.ts` | `mode: "mock"` wires both mocks; `mode: "live"` + both keys wires both real adapters; `mode: "live"` + one missing key falls back to mock for that provider only and emits exactly one warning; both keys missing emits two warnings; `fetchImpl` and `baseUrl` overrides reach the real adapter for network-free tests. |
+---
 
-## What is implemented so far
+## Design doc
 
-**Phase 1 — skeleton**
+See [`DESIGN.md`](./DESIGN.md) for the architecture, the per-decision
+tradeoffs, the failure-mode catalog, and the production gap analysis
+(distributed rate limiting, atomic budget reservation, secret
+management, multi-instance breaker state, etc.).
 
-- Fastify app builder + process entrypoint with graceful shutdown
-- `GET /health`
-- `GET /metrics` (Prometheus default Node metrics)
-- Request id correlation
-- Pino logger with redaction of auth headers
-- Zod-validated environment loader
-- Drizzle client factory and migration directory
-- Docker Compose with Postgres 16 + healthcheck
-- Vitest test setup using `app.inject(...)`
+---
 
-**Phase 2 — persistence + tenant auth**
+## Known limitations
 
-- Drizzle schema for `tenants`, `api_keys`, `provider_configs`,
-  `tenant_provider_allowlists`, `usage_ledger`, `request_logs`
-- Initial migration generated and applied via `npm run db:migrate`
-- Idempotent seed script with two tenants (different budgets and allowlists)
-- API keys stored as SHA-256 hashes; auth lookup is one indexed equality
-- Fastify `onRequest` auth hook protecting `/v1/*` (public paths still public)
-- `TenantRepository` with `findByApiKey`, `getBudgetConfig`, `getAllowlist`
-- `GET /v1/me` identity / smoke-test endpoint
+These are deliberate; each has a one-paragraph "production fix" in
+DESIGN.md.
 
-**Phase 3 — unified chat API + provider adapter abstraction**
-
-- `POST /v1/chat/completions` (non-streaming) with Zod-validated request body
-- `ProviderAdapter` interface: `complete`, `stream`, `estimateTokens`, `health`
-- Two mock provider adapters registered as `openai` and `anthropic`
-- `MockProviderBase` with failure injection: `5xx`, `rate-limit`, `timeout`,
-  `stream-drop` (after N chunks), `pre-stream-drop`
-- Failure injection via headers: `x-skyclad-fail`, `x-skyclad-fail-after`,
-  `x-skyclad-fail-delay`
-- `ProviderRegistry` + `buildProviderRegistry({ mode })` factory
-- `PricingRepository` reads `provider_configs` and computes `cost_usd` for
-  every response; in-process cache for the static price table
-- Normalized `UnifiedChatResponse` — no provider-specific fields leak
-
-**Phase 4 — cost-based routing + failover**
-
-- `RoutingPolicy` interface and `CostOptimizedRoutingPolicy` implementation
-- Filters: enabled (in SQL) → tenant allowlist → registered adapter → healthy
-- Ranks survivors ascending by estimated cost
-  `(input_price * estimated_in + output_price * max_tokens) / 1000`
-- Returns `RoutingDecision` with `selected` + ordered `fallback_candidates`
-- Chat handler walks the candidates: retryable failure → next, non-retryable
-  → 502, all-failed → 502 `all_providers_failed` with the per-provider trail
-- `ProviderHealthOracle` interface in place; default `AlwaysHealthyOracle`
-  is the seam a future circuit breaker plugs into
-- Per-provider failure injection via `x-skyclad-fail-provider: openai`,
-  enabling clean failover demos
-- Structured `routing decision` log line + `routing` summary on the response
-- Override path (`body.provider`) preserved as a debug-only knob, with
-  allowlist enforcement and no failover
-
-**Phase 5 — budget enforcement + per-tenant rate limiting**
-
-- `UsageLedgerRepository` (`getCurrentMonthSpend` + `recordUsage`) — Postgres
-  is the durable source of truth for tenant spend
-- Budget gate before every provider call: `SUM(cost_usd)` over the current
-  calendar month vs `tenants.monthly_budget_usd` → `402
-  TENANT_BUDGET_EXCEEDED` with `spent_usd` / `budget_usd` in the response
-- Append-only ledger write after every successful provider response —
-  ledger failures log loud, never break the response (deliberate trade,
-  documented in DESIGN.md)
-- Documented race window: post-call accounting can let concurrent requests
-  for the same tenant slightly overspend the cap. Production fix
-  (atomic pre-call reservation) called out in DESIGN.md
-- `TokenBucket` (per-tenant, in-memory, time-injectable) +
-  `InMemoryRateLimiter` (`RateLimiter` interface with a `RedisRateLimiter`
-  drop-in shape)
-- Bucket capacity is read from `tenants.rate_limit_per_minute` on every
-  call — Postgres remains the source of truth for the *config*; the
-  in-memory map is only the short-lived counter
-- `429 TENANT_RATE_LIMITED` with `Retry-After` (seconds), `X-RateLimit-Limit`,
-  `X-RateLimit-Remaining` headers
-- Single-node-only by design; the pluggable `RateLimiter` interface is the
-  seam a Redis-backed limiter slots into in production
-
-**Phase 6 — resilience: timeout, retry, circuit breaker**
-
-- `ResilientAdapter` wraps every `ProviderAdapter` in the registry without
-  changing the chat handler or routing module
-- Per-call timeout (default 20s) via `Promise.race` against `setTimeout`;
-  expiry synthesizes `ProviderError(504, retryable=true)` so the rest of
-  the resilience stack treats a slow upstream like an upstream 5xx
-- Bounded retries on retryable errors only (200ms then 500ms backoff +
-  30% jitter, 3 attempts total). `4xx` validation/auth errors are NEVER
-  retried; the underlying `ProviderError.retryable` flag is the
-  classifier
-- Per-provider `CircuitBreaker` (CLOSED → OPEN → HALF_OPEN). Opens after
-  5 failures in 60s, stays OPEN 30s, then HALF_OPEN admits exactly one
-  probe — success closes, failure reopens with the cooldown clock reset
-- `CircuitBreakerRegistry` doubles as the `ProviderHealthOracle` Phase 4
-  introduced — when a breaker is OPEN, the router skips the provider
-  with zero further wiring
-- Streaming has no retries by design (per the assignment: never after
-  bytes have been sent); the breaker still protects stream calls
-- Structured logs: `transient provider error, retrying` per attempt,
-  `circuit breaker state change` on every transition, `provider call
-  succeeded after retry` when retries actually saved a request
-
-**Phase 7 — deterministic-response cache**
-
-- New `cache_entries` table (uuid PK, tenant FK, jsonb body, expires_at)
-  with a composite UNIQUE on `(tenant_id, cache_key)` — cross-tenant
-  isolation enforced at the storage layer, not just at the key level
-- SHA-256 cache key over `(tenant_id, model_class, provider, model,
-  normalized messages, temperature, max_tokens)` — `tenant_id` is in
-  the hash AND in the WHERE clause; provider/model are in the hash so
-  a router fallback to a different upstream isn't served stale
-- Eligibility predicate `isCacheable(body)`: non-streaming AND
-  `temperature == 0` only. Anything else bypasses the cache for both
-  read and write
-- Cache lookup runs AFTER the routing decision. On hit: response
-  shape rebuilt with fresh `id` / `created_at` / `cached:true` /
-  `cost_usd:0` / `routing.policy:"cache"`, no provider call, no
-  `usage_ledger` write. On miss: failover loop runs, success is cached
-  keyed by the provider that actually answered (which may differ from
-  the originally selected one if a fallback ran)
-- Default 5-minute TTL via `DEFAULT_CACHE_CONFIG`; configurable through
-  `cacheConfig: { enabled, ttlMs }` on `buildApp`
-- `CacheRepository` get filters `expires_at > now()`, set is an upsert
-  on the composite unique index. No background sweeper for assignment
-  scope (stale rows are inert; production would add a periodic DELETE)
-- Cache write failures are non-fatal — they log loud but never break
-  the response; caching is an optimization, not part of the request's
-  correctness contract
-
-**Phase 8 — SSE streaming + partial-failure handling**
-
-- `POST /v1/chat/completions` with `stream: true` now returns
-  `text/event-stream` instead of 501. Same gates (rate limit, budget)
-  and same routing decision; only the response framing changes
-- Wire format: one `data: {...}\n\n` line per event. Three event
-  shapes: `{type:"token",content:"..."}`, `{type:"done"}`,
-  `{type:"error",message:"...",partial:true|false}`
-- **First-byte commitment** is the load-bearing rule. Before any
-  `token` event reaches the client: a retryable upstream error is
-  treated as a normal failover trigger; the chat handler walks the
-  candidate list and the client never observes the failure. After
-  the first `token`: NEVER retry, NEVER fall over. Emit one `error`
-  event with `partial:true`, end the stream cleanly, log the partial
-  outcome
-- Cache is bypassed for streams (the `isCacheable` predicate from
-  Phase 7 already returns false; the streaming branch sits before the
-  cache check anyway, so neither read nor write happens)
-- New `RequestLogRepository.insert` writes one `request_logs` row per
-  streaming outcome with `streaming=true` and one of: `success`,
-  `partial_failed` (tokens reached the client then upstream dropped),
-  `upstream_failed` (non-retryable error before first byte),
-  `all_providers_failed` (every candidate dropped pre-byte)
-- Usage is billed honestly: clean stream → upstream-reported usage;
-  partial stream → tokens accumulated from streamed deltas
-  (output tokens approximated via the `chars / 4` heuristic). Both
-  paths write to `usage_ledger`. `upstream_failed` and
-  `all_providers_failed` skip the ledger (no work done) but still
-  write `request_logs`
-
-**Phase 9 — observability (logs, metrics, admin usage)**
-
-- Single `recordRequestOutcome` helper in `observability/outcome.ts` is
-  the one call site that, for every terminal in both the streaming and
-  non-streaming paths, (a) writes a `request_logs` row, (b) updates the
-  seven Prometheus series, (c) emits the structured Pino log line. Logs
-  and metrics can no longer drift apart.
-- `request_logs` is now written for every outcome — `success`,
-  `partial_failed`, `upstream_failed`, `all_providers_failed`,
-  `rate_limited`, `budget_exceeded`, `invalid_request`,
-  `no_provider_available` — with the assignment-listed fields
-  (`request_id`, `tenant_id`, `provider`, `model`, `status`,
-  `error_type`, `latency_ms`, `cache_hit`, `streaming`,
-  `input_tokens`, `output_tokens`, `cost_usd`) populated.
-- `GET /metrics` exposes the seven gateway-level series in addition
-  to Node default metrics:
-  - `gateway_requests_total{tenant_id, provider, model, status}`
-  - `gateway_errors_total{tenant_id, provider, error_type}`
-  - `gateway_latency_ms{provider, model}` (histogram)
-  - `gateway_tokens_total{tenant_id, provider, model, token_type}`
-  - `gateway_cost_usd_total{tenant_id, provider, model}`
-  - `gateway_cache_hits_total{tenant_id}`
-  - `gateway_provider_circuit_state{provider, state}` (gauge with
-    `collect()` callback that snapshots the breaker registry at scrape
-    time — no background poller, no stale state)
-- `GET /admin/tenants/:tenantId/usage?from=YYYY-MM-DD&to=YYYY-MM-DD`
-  returns `{ tenant_id, total_cost_usd, total_input_tokens,
-  total_output_tokens, by_provider, by_model }` aggregated from
-  `usage_ledger` over a half-open date range. Bearer-protected by a
-  single `ADMIN_TOKEN` env var.
-- `ADMIN_TOKEN` empty / unset → `/admin/*` is not mounted at all
-  (404 to anyone). Misconfigured deploy fails closed.
-
-**Phase 10 — real OpenAI + Anthropic adapters**
-
-- `OpenAIProvider` (`POST /v1/chat/completions` with Bearer token,
-  optional `stream_options.include_usage` for streamed usage) and
-  `AnthropicProvider` (`POST /v1/messages` with `x-api-key`,
-  `anthropic-version: 2023-06-01`, system-message hoisting) both
-  implementing the same `ProviderAdapter` interface as the mocks.
-  Routing, failover, the resilience wrapper, the cache, the streaming
-  handler, `request_logs`, and `/metrics` work identically against
-  either kind of adapter.
-- Shared `parseSseStream` helper for both upstreams. Hand-rolled
-  (~70 lines) instead of pulling a dependency, with explicit handling
-  for chunk-boundary mid-line, `\r\n` endings, comment lines, and
-  EOF without a trailing blank line.
-- Single `mapHttpStatusToProviderError` + `mapTransportErrorToProviderError`
-  classification used by both real adapters: 4xx → not retryable
-  (no failover, no retry), 429 → retryable (gets retries plus
-  failover, the spec's "may fallback"), 5xx + transport (DNS, ECONN,
-  AbortError) → retryable. Mocks already throw the same `ProviderError`
-  shape, so the rest of the gateway sees one uniform error contract.
-- Token usage prefers upstream-reported figures (OpenAI's
-  `prompt_tokens`/`completion_tokens`, Anthropic's `usage` block in
-  `message_start` / `message_delta`) and falls back to the existing
-  chars/4 estimator only when the upstream omits them.
-- Mode selection via `MOCK_PROVIDERS` env var (default `true`). When
-  `false`, each provider goes real if its API key is set, otherwise
-  falls back to mock per-provider with a logged warning. Tests
-  default to mock mode unconditionally; the test suite never makes
-  a real network call.
-
-**Phase 11 — evaluator-friendly admin helpers**
-
-- `MockFailureStore` — a process-local map consulted by every mock
-  call. `MockProviderBase.resolveFailure` reads in priority order:
-  per-request `x-skyclad-fail` header (wins) → store entry → none.
-  Means "OpenAI is broken" can be set with one curl and held until
-  cleared, instead of remembering to attach a header to every demo
-  request.
-- `POST /admin/mock-providers/:provider/failure-mode` (Bearer
-  ADMIN_TOKEN). Discriminated-union body: `normal`, `fail_5xx`,
-  `timeout`, `stream_drop_before_first_token`,
-  `stream_drop_after_chunks` (with required `chunks`). Translates
-  to the existing `FailureInjection` shape and writes it to the
-  store. Restricted to known mock provider names (`openai`,
-  `anthropic`); 400 on anything else.
-- `POST /admin/tenants/:tenantId/reset-usage` — `DELETE FROM
-  usage_ledger WHERE tenant_id = $1`, returns `rows_deleted`. Used
-  to demo the budget-exhausted-then-recovered flow without waiting
-  for monthly rollover or dropping into psql.
-- `POST /admin/tenants/:tenantId/set-budget` (`{monthly_budget_usd}`)
-  — `UPDATE tenants SET monthly_budget_usd = ...`. The auth hook
-  re-reads the tenant on every request, so the change applies on the
-  very next call. Validates: non-negative + finite; 404 on unknown
-  tenant.
-- All three endpoints share the existing ADMIN_TOKEN Bearer hook (so
-  `unset ADMIN_TOKEN` = endpoints not registered = 404 — fail closed
-  on misconfigured deploys) and stamp `x-skyclad-eval-only: true` on
-  every response so post-hoc log scans can spot when they were used.
-- The admin plugin is now wrapped in `app.register(...)` so the
-  Bearer hook is encapsulated to `/admin/*` only — without that
-  wrapper the hook would also reject normal `/v1/chat/completions`
-  traffic. (The original Phase-9 code happened to work because no
-  test exercised both surfaces in one process; Phase 11's tests do.)
-
-## What is intentionally NOT yet implemented
-
-Nothing scoped to the assignment is missing. Production gaps that are
-deliberately out of scope (called out in `DESIGN.md`): multi-instance
-circuit-breaker state via Redis pub/sub, atomic budget reservation
-against the ledger, RBAC on the admin surface, dropping `tenant_id`
-from Prometheus labels at fleet scale, and tokenizer-accurate token
-counts (vs the chars/4 heuristic) for pre-call routing decisions.
-
-## Repo layout
-
-```
-src/
-  app.ts                     Fastify app builder (request id, /health, error handler, /v1 mount)
-  server.ts                  Process entry, graceful shutdown
-  config.ts                  Zod env validation
-  logger.ts                  Pino setup
-  modules/
-    auth/
-      hash.ts                SHA-256 hash + key generator
-      hook.ts                Fastify onRequest auth hook (Bearer -> tenant)
-    tenants/
-      types.ts               AuthenticatedTenant interface
-      repository.ts          findByApiKey, getBudgetConfig, getAllowlist
-      routes.ts              GET /v1/me
-    chat/
-      validation.ts          Zod schema for POST /v1/chat/completions body
-      routes.ts              POST /v1/chat/completions handler
-    providers/
-      types.ts               ChatMessage, UnifiedChat*, Provider*, FailureInjection
-      errors.ts              ProviderError class
-      tokens.ts              Token estimator (chars / 4 heuristic)
-      failure-injection.ts   Header parser for x-skyclad-fail*
-      mock-base.ts           Shared mock behaviour (failures, streaming)
-      mock-openai.ts         MockOpenAIProvider (registered as "openai")
-      mock-anthropic.ts      MockAnthropicProvider (registered as "anthropic")
-      openai-real.ts         OpenAIProvider (real chat/completions adapter)
-      anthropic-real.ts      AnthropicProvider (real messages API adapter)
-      sse-parser.ts          Shared line-based SSE parser used by both real adapters
-      http-errors.ts         mapHttpStatusToProviderError + mapTransportErrorToProviderError
-      registry.ts            ProviderRegistry (in-memory map by name)
-      factory.ts             buildProviderRegistry({ mode, keys, ... }) — mock vs live + per-provider fallback
-      pricing.ts             PricingRepository + calculateCost (+ listEnabledByModelClass)
-    routing/
-      types.ts               RoutingPolicy, RouteCandidate, RoutingDecision, ProviderHealthOracle
-      health.ts              AlwaysHealthyOracle (circuit breaker plugs in here)
-      cost-optimized.ts      CostOptimizedRoutingPolicy
-    budget/
-      repository.ts          UsageLedgerRepository (getCurrentMonthSpend + recordUsage)
-    ratelimit/
-      token-bucket.ts        Single-node TokenBucket (time-injectable for tests)
-      rate-limiter.ts        RateLimiter interface + InMemoryRateLimiter
-    resilience/
-      types.ts               BreakerState, RetryPolicy, ResilienceConfig
-      defaults.ts            DEFAULT_RESILIENCE_CONFIG (20s timeout, 3 attempts, 5/60s breaker)
-      circuit-breaker.ts     CircuitBreaker + CircuitBreakerRegistry (= ProviderHealthOracle)
-      resilient-adapter.ts   ResilientAdapter wrapper + withTimeout helper
-      factory.ts             buildResilientRegistry (wraps every adapter in the registry)
-    cache/
-      types.ts               CacheConfig, CacheKeyInput, CachedResponsePayload
-      defaults.ts            DEFAULT_CACHE_CONFIG (5-min TTL)
-      key.ts                 buildCacheKey (sha256 over tenant + routing + messages)
-      policy.ts              isCacheable (non-streaming + temperature == 0)
-      repository.ts          CacheRepository (Postgres-backed get/set)
-    streaming/
-      sse.ts                 formatSSEEvent (token / done / error wire format)
-      handler.ts             streamChatCompletion (failover before 1st byte; partial after)
-    observability/
-      metrics.ts             prom-client default registry + Node defaults
-      gateway-metrics.ts     7 gateway-level series + breaker-state gauge
-      outcome.ts             recordRequestOutcome (request_logs + metrics + log line)
-      routes.ts              GET /metrics
-    admin/
-      routes.ts              GET /admin/tenants/:id/usage (ADMIN_TOKEN-gated)
-    persistence/
-      request-logs-repo.ts   RequestLogRepository (writes for every terminal)
-db/
-  schema.ts                  Drizzle table definitions (7 tables)
-  client.ts                  createDbHandle factory
-  migrate.ts                 Programmatic migration runner
-  seed.ts                    Idempotent seedDatabase + script entry
-  seed-fixtures.ts           Shared seed/test constants (tenants, keys, prices)
-  migrations/                drizzle-kit-generated SQL
-tests/
-  setup/db.ts                Test DB bootstrap (auto-create, migrate, seed) + truncate helpers
-  health.test.ts
-  auth.test.ts
-  tenants.test.ts
-  providers.test.ts
-  chat.test.ts
-  routing.test.ts
-  budget.test.ts
-  ratelimit.test.ts
-  resilience.test.ts
-  cache.test.ts
-  streaming.test.ts
-  observability.test.ts
-  admin-usage.test.ts
-  providers-real.test.ts
-  factory.test.ts
-```
-
-## Useful one-liners
-
-```bash
-# Reset the dev DB
-docker compose down -v && docker compose up -d postgres
-npm run db:migrate && npm run db:seed
-
-# See what's in the tenants table
-docker exec -it skyclad-postgres psql -U gateway -d gateway -c "SELECT id, name, monthly_budget_usd, rate_limit_per_minute FROM tenants;"
-
-# See what's in the price table
-docker exec -it skyclad-postgres psql -U gateway -d gateway -c "SELECT provider, model, model_class, input_cost_per_1k_tokens, output_cost_per_1k_tokens FROM provider_configs ORDER BY model_class, provider;"
-```
+- **Drizzle ORM, not Prisma.** Drizzle was chosen because tenant
+  config, API keys, the usage ledger, provider allowlists, request
+  logs, and budget aggregation all benefit from SQL-first control.
+  Migrations are generated, applied, and inspectable as plain SQL.
+  Prisma's runtime indirection gets in the way for an exercise
+  whose grading rewards explicit, defensible queries.
+- **Rate limiting is single-node, in-memory, and resets on process
+  restart.** Configuration (rate per minute) is in Postgres; the
+  counter is in-process. Tenant A burning their bucket on instance
+  X does not slow Tenant A on instance Y. Production fix: Redis
+  token-bucket behind the same `RateLimiter` interface.
+- **Budget accounting is post-request.** Under high concurrency a
+  tenant can briefly overspend their cap (bounded by
+  in-flight-request-count × per-request-cost, typically pennies).
+  Production fix: two-phase reservation — pre-call estimated debit,
+  post-call reconciliation — with the ledger as source of truth.
+- **`chars / 4` token estimator.** Used for pre-call cost routing
+  and for billable-token accounting on partial streams when
+  upstream usage isn't yet known. Real adapters prefer
+  upstream-reported usage; mocks always use the heuristic. Off by
+  20–30% vs a real tokenizer; never used to make a hard policy
+  decision (only to rank candidates).
+- **One shared `ADMIN_TOKEN` for `/admin/*`.** No per-operator
+  identity, no audit trail of who hit what. Fine for a local
+  evaluator; not fine for a production billing surface. Production
+  fix: OIDC/JWKS in front of the admin routes plus an
+  `admin_audit` table with `actor_email, action, target,
+  before, after`.
+- **Mock providers are the default.** A fresh clone runs against
+  in-process mocks so tests and demos cost nothing and produce
+  deterministic output. To exercise real upstreams, set
+  `MOCK_PROVIDERS=false` plus the relevant API key(s) and
+  restart. Tests **always** use mocks unconditionally — the suite
+  never makes a real network call.

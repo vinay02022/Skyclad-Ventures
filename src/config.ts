@@ -34,6 +34,17 @@ const EnvSchema = z.object({
   // manager and split per-operator (we don't because the assignment scope
   // is one operator).
   ADMIN_TOKEN: z.string().optional().default(""),
+  // Phase 7 cache TTL, in seconds. Defaults to 5 minutes — long enough
+  // that a developer iterating on the same prompt sees real savings,
+  // short enough that a model swap or upstream change isn't reflected
+  // for hours. Set to 0 to disable cache writes via the boolean flag
+  // in DEFAULT_CACHE_CONFIG instead; this knob only resizes the TTL.
+  CACHE_TTL_SECONDS: z.coerce.number().int().nonnegative().default(300),
+  // Phase 6 per-call provider timeout, in milliseconds. Default 20s
+  // matches the assignment spec. Below this, the timeout wrapper
+  // synthesizes a retryable 504 and the resilience layer either retries
+  // or fails over.
+  PROVIDER_TIMEOUT_MS: z.coerce.number().int().positive().default(20_000),
 });
 
 export type AppConfig = z.infer<typeof EnvSchema>;

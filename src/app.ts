@@ -174,7 +174,12 @@ export async function buildApp({
     // stay unchanged. The CircuitBreakerRegistry doubles as the
     // ProviderHealthOracle the router consumes — when a breaker is OPEN,
     // the router skips the provider entirely.
-    const resilienceConfig = resilience ?? DEFAULT_RESILIENCE_CONFIG;
+    // Resilience config is the in-process default unless the caller
+    // (a test) injected an explicit config; the per-call timeout is
+    // env-overridable via PROVIDER_TIMEOUT_MS so an operator can tune
+    // it without a redeploy.
+    const resilienceConfig: ResilienceConfig =
+      resilience ?? { ...DEFAULT_RESILIENCE_CONFIG, timeoutMs: config.PROVIDER_TIMEOUT_MS };
     const resilienceLogger: ResilienceLogger = {
       info: (obj, msg) => logger.info(obj, msg),
       warn: (obj, msg) => logger.warn(obj, msg),
@@ -202,7 +207,9 @@ export async function buildApp({
     // provider/model the router would have called, and skips both lookup
     // and write for streaming or temperature > 0.
     const cacheRepo = cache ?? new CacheRepository(db);
-    const cacheCfg = cacheConfig ?? DEFAULT_CACHE_CONFIG;
+    // Cache TTL is env-overridable via CACHE_TTL_SECONDS (default 300).
+    const cacheCfg =
+      cacheConfig ?? { ...DEFAULT_CACHE_CONFIG, ttlMs: config.CACHE_TTL_SECONDS * 1_000 };
     // Phase 8/9: request_logs writes for every terminal (streaming and
     // non-streaming alike). The recordRequestOutcome helper in
     // observability/outcome.ts is the single call site that writes a

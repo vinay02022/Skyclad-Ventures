@@ -34,6 +34,24 @@ Locked in so far:
 - **No off-the-shelf gateway** (LiteLLM/Portkey/etc.) — assignment hard
   constraint, and the point is to show the engineering judgment those
   libraries embed.
+- **One routing policy: cost-optimized with failover.** The spec asks for
+  one non-trivial policy. Cost-optimized exercises every routing seam
+  (allowlist filter, enabled filter, registry filter, health filter, cost
+  ranking, ordered fallback) and is the policy a budget-bound tenant
+  actually wants. The seam (`RoutingPolicy.pick`) makes a future
+  latency-aware policy a drop-in. Building both today would be over-
+  engineering. Cost: latency variance between providers is invisible to
+  the router (Phase 6 metrics will surface it for humans).
+- **`ProviderHealthOracle` interface in place before the breaker exists.**
+  Phase 4 ships an `AlwaysHealthyOracle`. Phase 5's circuit breaker plugs
+  into the same interface — no router changes. Cost: a small extra
+  abstraction now, in exchange for not having to refactor the routing
+  module a phase later.
+- **Failover only happens before the first byte is written.** Non-streaming
+  is trivially safe. For streaming (later phase), the loop only applies up
+  to the first emitted chunk; after that, `stream-drop` is `retryable:
+  false` and we surface a final SSE error event with `partial=true` rather
+  than silently retry. Documented as a hard rule, not a default.
 
 More decisions get added as adapters, routing, cache, and streaming land.
 

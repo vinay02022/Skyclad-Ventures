@@ -39,7 +39,9 @@ curl -H "Authorization: Bearer sk_test_tenanta_demo_key_DO_NOT_USE_IN_PROD" \
 curl -H "Authorization: Bearer sk_test_tenantb_demo_key_DO_NOT_USE_IN_PROD" \
   http://localhost:8080/v1/me
 
-# Chat completion (non-streaming). Default provider in Phase 3 is openai (mock).
+# Chat completion (non-streaming). Phase 4: cost-optimized router picks the
+# cheapest provider in tenant_a's allowlist that serves the cheap class.
+# Returns body.routing = { policy, candidate_count, fallback_used, reason }.
 curl -X POST http://localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer sk_test_tenanta_demo_key_DO_NOT_USE_IN_PROD" \
   -H "Content-Type: application/json" \
@@ -48,14 +50,24 @@ curl -X POST http://localhost:8080/v1/chat/completions \
     "messages": [{"role":"user","content":"hello there"}]
   }'
 
-# Force the upstream to fail with a 5xx for failure-injection testing
+# Failover demo: fail the cheapest pick (openai) only, watch the router fall
+# through to anthropic. body.routing.fallback_used will be true.
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer sk_test_tenanta_demo_key_DO_NOT_USE_IN_PROD" \
+  -H "Content-Type: application/json" \
+  -H "x-skyclad-fail: 5xx" \
+  -H "x-skyclad-fail-provider: openai" \
+  -d '{ "model_class": "cheap", "messages": [{"role":"user","content":"hi"}] }'
+
+# Force EVERY upstream to fail. Endpoint returns 502 all_providers_failed
+# with the per-provider error trail and attempt count.
 curl -X POST http://localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer sk_test_tenanta_demo_key_DO_NOT_USE_IN_PROD" \
   -H "Content-Type: application/json" \
   -H "x-skyclad-fail: 5xx" \
   -d '{ "model_class": "cheap", "messages": [{"role":"user","content":"hi"}] }'
 
-# Pin the anthropic mock and ask for a premium model
+# Override the router (debug only): pin a provider/model. No failover applies.
 curl -X POST http://localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer sk_test_tenanta_demo_key_DO_NOT_USE_IN_PROD" \
   -H "Content-Type: application/json" \
@@ -77,6 +89,7 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 | `x-skyclad-fail` | `stream-drop` | `stream()` emits N chunks, then throws. Not retryable. |
 | `x-skyclad-fail-after` | integer | For `stream-drop`: number of chunks before the failure. |
 | `x-skyclad-fail-delay` | integer (ms) | Optional artificial latency before the (failing) call. |
+| `x-skyclad-fail-provider` | provider name | Limit the failure to a single provider — essential for proving failover (`x-skyclad-fail-provider: openai`). |
 
 ## Tests
 
@@ -95,7 +108,8 @@ spurious failures on a fresh clone.
 | `tests/auth.test.ts` | Missing / unknown / valid bearer tokens, two seeded tenants, `/health` and `/metrics` are public. |
 | `tests/tenants.test.ts` | `TenantRepository` lookup by hashed API key, budget config read, allowlist read, tenant-A vs tenant-B isolation. |
 | `tests/providers.test.ts` | Mock provider adapters: name, model resolution, `complete`, `stream`, all five failure modes, token estimation, health. |
-| `tests/chat.test.ts` | `POST /v1/chat/completions` end-to-end: auth, validation (missing fields, empty messages), normalized response shape, no provider-specific field leakage, provider override, model_class resolution, forced 5xx via header, 501 for stream:true, both seeded tenants. |
+| `tests/chat.test.ts` | `POST /v1/chat/completions` end-to-end: auth, validation, normalized response shape, override path (pin provider), router-driven path, **failover** when first provider fails, 502 all-providers-failed, allowlist-induced 503 for tenant_b, 501 for stream:true. |
+| `tests/routing.test.ts` | `CostOptimizedRoutingPolicy` unit tests with in-memory fakes: cheapest-wins, allowlist filter, missing-adapter filter, unhealthy-provider filter, returns null when nothing eligible, and the disabled-row contract (filtered in SQL). |
 
 ## What is implemented so far
 
@@ -136,11 +150,28 @@ spurious failures on a fresh clone.
   every response; in-process cache for the static price table
 - Normalized `UnifiedChatResponse` — no provider-specific fields leak
 
+**Phase 4 — cost-based routing + failover**
+
+- `RoutingPolicy` interface and `CostOptimizedRoutingPolicy` implementation
+- Filters: enabled (in SQL) → tenant allowlist → registered adapter → healthy
+- Ranks survivors ascending by estimated cost
+  `(input_price * estimated_in + output_price * max_tokens) / 1000`
+- Returns `RoutingDecision` with `selected` + ordered `fallback_candidates`
+- Chat handler walks the candidates: retryable failure → next, non-retryable
+  → 502, all-failed → 502 `all_providers_failed` with the per-provider trail
+- `ProviderHealthOracle` interface in place; default `AlwaysHealthyOracle`
+  is the seam Phase 5's circuit breaker plugs into
+- Per-provider failure injection via `x-skyclad-fail-provider: openai`,
+  enabling clean failover demos
+- Structured `routing decision` log line + `routing` summary on the response
+- Override path (`body.provider`) preserved as a debug-only knob, with
+  allowlist enforcement and no failover
+
 ## What is intentionally NOT yet implemented
 
-Routing (cost-based selection across allowlist), retries, circuit breaker,
-cache, SSE streaming end-to-end, request logging, usage ledger writes, budget
-enforcement, rate limiting. Each lands in its own phase.
+Retries with backoff, circuit breaker (Phase 5 swaps in for the oracle),
+response cache, SSE streaming end-to-end, request logging, usage ledger writes,
+budget enforcement, rate limiting. Each lands in its own phase.
 
 ## Repo layout
 
@@ -171,8 +202,11 @@ src/
       mock-anthropic.ts      MockAnthropicProvider (registered as "anthropic")
       registry.ts            ProviderRegistry (in-memory map by name)
       factory.ts             buildProviderRegistry({ mode })
-      pricing.ts             PricingRepository + calculateCost
-    routing/                 (placeholder)
+      pricing.ts             PricingRepository + calculateCost (+ listEnabledByModelClass)
+    routing/
+      types.ts               RoutingPolicy, RouteCandidate, RoutingDecision, ProviderHealthOracle
+      health.ts              AlwaysHealthyOracle (Phase 5 circuit breaker plugs in here)
+      cost-optimized.ts      CostOptimizedRoutingPolicy
     resilience/              (placeholder)
     cache/                   (placeholder)
     streaming/               (placeholder)
@@ -192,6 +226,9 @@ tests/
   health.test.ts
   auth.test.ts
   tenants.test.ts
+  providers.test.ts
+  chat.test.ts
+  routing.test.ts
 ```
 
 ## Useful one-liners

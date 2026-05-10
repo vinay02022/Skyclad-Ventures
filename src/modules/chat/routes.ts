@@ -5,6 +5,7 @@ import { buildCacheKey } from "../cache/key.js";
 import { isCacheable } from "../cache/policy.js";
 import type { CacheRepository } from "../cache/repository.js";
 import type { CacheConfig, CachedResponsePayload } from "../cache/types.js";
+import type { RequestLogRepository } from "../persistence/request-logs-repo.js";
 import { ProviderError } from "../providers/errors.js";
 import { parseFailureInjection } from "../providers/failure-injection.js";
 import { calculateCost, PricingRepository } from "../providers/pricing.js";
@@ -21,6 +22,7 @@ import type {
   RoutingDecision,
   RoutingPolicy,
 } from "../routing/types.js";
+import { streamChatCompletion } from "../streaming/handler.js";
 import type { TenantRepository } from "../tenants/repository.js";
 import { ChatRequestSchema, type ParsedChatRequest } from "./validation.js";
 
@@ -34,6 +36,7 @@ export interface RegisterChatRoutesDeps {
   usageLedger: UsageLedgerRepository;
   cache: CacheRepository;
   cacheConfig: CacheConfig;
+  requestLogs: RequestLogRepository;
 }
 
 /**
@@ -94,16 +97,10 @@ export async function registerChatRoutes(
     }
     const body = parsed.data;
 
-    if (body.stream) {
-      return reply.code(501).send({
-        error: "not_implemented",
-        message:
-          "SSE streaming over /v1/chat/completions lands in a later phase. " +
-          "The mock providers already support streaming at the adapter level " +
-          "(see tests/providers.test.ts).",
-        request_id: req.id,
-      });
-    }
+    // Streaming requests follow the same gates and routing as non-streaming
+    // ones; the SSE wire format and partial-failure handling live in the
+    // dedicated streaming handler. We don't branch here — we branch after
+    // the routing decision, so the streaming path inherits failover.
 
     // ---- 2. Rate-limit gate ------------------------------------------
     // Cheapest reject path: a single in-memory map lookup + arithmetic. No
@@ -216,6 +213,26 @@ export async function registerChatRoutes(
       order = [decision.selected, ...decision.fallback_candidates];
       routePolicyName = decision.policy;
       candidatesConsidered = decision.candidates_considered;
+    }
+
+    // ---- 5a. Streaming branch ---------------------------------------
+    // Streaming hands off to the SSE handler now (after gates + routing,
+    // before cache + failover loop). The handler owns SSE framing,
+    // first-byte commitment, partial-error events, and the
+    // ledger/request_logs writes for streaming outcomes. Cache is
+    // bypassed because isCacheable(body) returns false for stream:true.
+    if (body.stream) {
+      await streamChatCompletion(req, reply, deps, {
+        tenantId: tenant.id,
+        modelClass: body.model_class,
+        messages: body.messages,
+        temperature: body.temperature,
+        maxTokens: body.max_tokens,
+        routePolicyName,
+        candidatesConsidered,
+        order,
+      });
+      return;
     }
 
     // ---- 5. Cache lookup --------------------------------------------

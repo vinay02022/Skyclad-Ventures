@@ -275,15 +275,20 @@ describe.skipIf(!dbAvailable)("POST /v1/chat/completions", () => {
     expect(body.errors.length).toBeGreaterThanOrEqual(2);
   });
 
-  it("returns 501 for stream:true (SSE wiring lands in a later phase)", async () => {
+  it("hands stream:true off to the SSE handler (200 + text/event-stream)", async () => {
+    // chat.test.ts owns routing/failover assertions; the SSE wire format
+    // and partial-failure semantics are exercised in tests/streaming.test.ts.
+    // All this test cares about is that the chat handler now branches to
+    // the streaming path instead of returning 501.
     const res = await app.inject({
       method: "POST",
       url: "/v1/chat/completions",
       headers: tenantAHeaders,
       payload: goodBody({ stream: true }),
     });
-    expect(res.statusCode).toBe(501);
-    expect(res.json().error).toBe("not_implemented");
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["content-type"]).toContain("text/event-stream");
+    expect(res.payload).toContain('"type":"done"');
   });
 
   it("does NOT leak provider-specific fields (no choices[], no system_fingerprint)", async () => {

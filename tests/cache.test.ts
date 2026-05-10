@@ -432,16 +432,17 @@ describe.skipIf(!dbAvailable)("POST /v1/chat/completions caching", () => {
       [TENANT_A_ID],
     );
 
-    // Streaming returns 501 (SSE wiring lands later). The point of this
-    // test is that no cache_entries row materializes for the streaming
-    // request, even after.
+    // Streaming returns 200 SSE (Phase 8). The point of this test is
+    // that no cache_entries row materializes for the streaming
+    // request — neither read nor write — regardless of outcome.
     const stream = await app.inject({
       method: "POST",
       url: "/v1/chat/completions",
       headers: tenantAHeaders,
       payload: cacheableBody({ stream: true }),
     });
-    expect(stream.statusCode).toBe(501);
+    expect(stream.statusCode).toBe(200);
+    expect(stream.headers["content-type"]).toContain("text/event-stream");
 
     const cacheRowsAfter = await handle.pool.query(
       "SELECT count(*)::int AS n FROM cache_entries WHERE tenant_id = $1",

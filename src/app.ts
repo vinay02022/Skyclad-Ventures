@@ -17,6 +17,7 @@ import { CacheRepository } from "./modules/cache/repository.js";
 import type { CacheConfig } from "./modules/cache/types.js";
 import { registerChatRoutes } from "./modules/chat/routes.js";
 import { registerObservabilityRoutes } from "./modules/observability/routes.js";
+import { RequestLogRepository } from "./modules/persistence/request-logs-repo.js";
 import { buildProviderRegistry } from "./modules/providers/factory.js";
 import { PricingRepository } from "./modules/providers/pricing.js";
 import type { ProviderRegistry } from "./modules/providers/registry.js";
@@ -63,6 +64,10 @@ export interface BuildAppOptions {
   // else. Production uses the default 5-minute TTL.
   cache?: CacheRepository;
   cacheConfig?: CacheConfig;
+  // Phase 8: request_logs writer (currently used by the streaming path).
+  // Tests inject the same repo they read back to assert request_logs
+  // rows materialized for partial-failure scenarios.
+  requestLogs?: RequestLogRepository;
 }
 
 // App builder is separated from the listener so tests can use `app.inject(...)`
@@ -80,6 +85,7 @@ export async function buildApp({
   breakers,
   cache,
   cacheConfig,
+  requestLogs,
 }: BuildAppOptions): Promise<FastifyInstance> {
   const app = Fastify({
     // Pino's Logger is structurally compatible with FastifyBaseLogger at runtime;
@@ -161,6 +167,10 @@ export async function buildApp({
     // and write for streaming or temperature > 0.
     const cacheRepo = cache ?? new CacheRepository(db);
     const cacheCfg = cacheConfig ?? DEFAULT_CACHE_CONFIG;
+    // Phase 8: request_logs writes for streaming outcomes. Non-streaming
+    // paths still log only via Pino; full request_logs coverage lands
+    // alongside the per-tenant Prometheus histograms.
+    const requestLogsRepo = requestLogs ?? new RequestLogRepository(db);
     await registerChatRoutes(app, {
       providers: providerRegistry,
       pricing: pricingRepo,
@@ -171,6 +181,7 @@ export async function buildApp({
       usageLedger: ledgerRepo,
       cache: cacheRepo,
       cacheConfig: cacheCfg,
+      requestLogs: requestLogsRepo,
     });
   }
 

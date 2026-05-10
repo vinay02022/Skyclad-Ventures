@@ -109,3 +109,11 @@ export async function truncateUsageLedger(handle: DbHandle): Promise<void> {
 export async function truncateCacheEntries(handle: DbHandle): Promise<void> {
   await handle.pool.query("TRUNCATE TABLE cache_entries RESTART IDENTITY");
 }
+
+/**
+ * Truncate just the request_logs. Streaming tests use this in beforeEach
+ * so each scenario can read back the exact rows it wrote.
+ */
+export async function truncateRequestLogs(handle: DbHandle): Promise<void> {
+  await handle.pool.query("TRUNCATE TABLE request_logs RESTART IDENTITY");
+}

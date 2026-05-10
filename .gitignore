@@ -1,0 +1,18 @@
+node_modules/
+dist/
+coverage/
+.env
+.env.local
+*.log
+.DS_Store
+.vscode/
+.idea/
+
+# Local planning / assignment artifacts. Kept out of the public repo so the
+# submission shows the engineering work, not the brief or the build journal.
+# Both hyphen and em-dash variants are listed because the brief sometimes
+# travels around with the em-dash version of the filename.
+Skyclad Ventures - Senior Backend Engineer Assignment.md
+Skyclad Ventures — Senior Backend Engineer Assignment.md
+Master_Updated.md
+How_its_working/

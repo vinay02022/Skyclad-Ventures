@@ -1,0 +1,26 @@
+# Single-node local stack. Postgres only for Phase 1.
+# The gateway itself runs on the host (`npm run dev`) for fast iteration.
+# A gateway service can be added later if/when the evaluator wants
+# `docker compose up` to bring everything up in one command.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: skyclad-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: gateway
+      POSTGRES_PASSWORD: gateway
+      POSTGRES_DB: gateway
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gateway -d gateway"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:

@@ -76,6 +76,27 @@ curl -X POST http://localhost:8080/v1/chat/completions \
     "provider": "anthropic",
     "messages": [{"role":"user","content":"explain SSL termination"}]
   }'
+
+# Phase 5: trip the per-tenant rate limit. tenant_b is seeded at 10/min,
+# so the 11th call in the same minute returns 429 TENANT_RATE_LIMITED.
+for i in $(seq 1 11); do
+  curl -s -o /dev/null -w "%{http_code}\n" \
+    -X POST http://localhost:8080/v1/chat/completions \
+    -H "Authorization: Bearer sk_test_tenantb_demo_key_DO_NOT_USE_IN_PROD" \
+    -H "Content-Type: application/json" \
+    -d '{"model_class":"cheap","messages":[{"role":"user","content":"hi"}]}'
+done
+
+# Phase 5: trip the per-tenant budget. Inserting a synthetic ledger row that
+# exceeds tenant_b's $2 cap, then any next request returns 402 with the
+# spent_usd / budget_usd numbers.
+docker exec -it skyclad-postgres psql -U gateway -d gateway -c \
+  "INSERT INTO usage_ledger (tenant_id, provider, model, request_id, input_tokens, output_tokens, cost_usd) \
+   VALUES ('00000000-0000-0000-0000-00000000000b','openai','gpt-4o-mini','req-demo-overspend',1,1,2.5);"
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer sk_test_tenantb_demo_key_DO_NOT_USE_IN_PROD" \
+  -H "Content-Type: application/json" \
+  -d '{"model_class":"cheap","messages":[{"role":"user","content":"hi"}]}'
 ```
 
 ### Failure injection knobs (mock providers only)
@@ -110,6 +131,8 @@ spurious failures on a fresh clone.
 | `tests/providers.test.ts` | Mock provider adapters: name, model resolution, `complete`, `stream`, all five failure modes, token estimation, health. |
 | `tests/chat.test.ts` | `POST /v1/chat/completions` end-to-end: auth, validation, normalized response shape, override path (pin provider), router-driven path, **failover** when first provider fails, 502 all-providers-failed, allowlist-induced 503 for tenant_b, 501 for stream:true. |
 | `tests/routing.test.ts` | `CostOptimizedRoutingPolicy` unit tests with in-memory fakes: cheapest-wins, allowlist filter, missing-adapter filter, unhealthy-provider filter, returns null when nothing eligible, and the disabled-row contract (filtered in SQL). |
+| `tests/budget.test.ts` | `UsageLedgerRepository` round-trip + tenant isolation; chat endpoint writes a `usage_ledger` row on success; `402 TENANT_BUDGET_EXCEEDED` once the SUM crosses `monthly_budget_usd`; tenant_a still succeeds while tenant_b is over budget. |
+| `tests/ratelimit.test.ts` | `TokenBucket` unit (drain, refill, retryAfterMs, reconfigure clamp), `InMemoryRateLimiter` per-tenant isolation + reconfigure + `reset()`, integration: tenant_b at 10/min returns `429 TENANT_RATE_LIMITED` on burst 11, `Retry-After` header set, tenant_a unaffected. |
 
 ## What is implemented so far
 
@@ -160,18 +183,43 @@ spurious failures on a fresh clone.
 - Chat handler walks the candidates: retryable failure → next, non-retryable
   → 502, all-failed → 502 `all_providers_failed` with the per-provider trail
 - `ProviderHealthOracle` interface in place; default `AlwaysHealthyOracle`
-  is the seam Phase 5's circuit breaker plugs into
+  is the seam a future circuit breaker plugs into
 - Per-provider failure injection via `x-skyclad-fail-provider: openai`,
   enabling clean failover demos
 - Structured `routing decision` log line + `routing` summary on the response
 - Override path (`body.provider`) preserved as a debug-only knob, with
   allowlist enforcement and no failover
 
+**Phase 5 — budget enforcement + per-tenant rate limiting**
+
+- `UsageLedgerRepository` (`getCurrentMonthSpend` + `recordUsage`) — Postgres
+  is the durable source of truth for tenant spend
+- Budget gate before every provider call: `SUM(cost_usd)` over the current
+  calendar month vs `tenants.monthly_budget_usd` → `402
+  TENANT_BUDGET_EXCEEDED` with `spent_usd` / `budget_usd` in the response
+- Append-only ledger write after every successful provider response —
+  ledger failures log loud, never break the response (deliberate trade,
+  documented in DESIGN.md)
+- Documented race window: post-call accounting can let concurrent requests
+  for the same tenant slightly overspend the cap. Production fix
+  (atomic pre-call reservation) called out in DESIGN.md
+- `TokenBucket` (per-tenant, in-memory, time-injectable) +
+  `InMemoryRateLimiter` (`RateLimiter` interface with a `RedisRateLimiter`
+  drop-in shape)
+- Bucket capacity is read from `tenants.rate_limit_per_minute` on every
+  call — Postgres remains the source of truth for the *config*; the
+  in-memory map is only the short-lived counter
+- `429 TENANT_RATE_LIMITED` with `Retry-After` (seconds), `X-RateLimit-Limit`,
+  `X-RateLimit-Remaining` headers
+- Single-node-only by design; the pluggable `RateLimiter` interface is the
+  seam a Redis-backed limiter slots into in production
+
 ## What is intentionally NOT yet implemented
 
-Retries with backoff, circuit breaker (Phase 5 swaps in for the oracle),
-response cache, SSE streaming end-to-end, request logging, usage ledger writes,
-budget enforcement, rate limiting. Each lands in its own phase.
+Retries with backoff, circuit breaker (slots into the existing
+`ProviderHealthOracle` seam), per-call timeout via `AbortController`,
+response cache, SSE streaming end-to-end, `request_logs` writes,
+per-tenant/provider/model metrics. Each lands in its own phase.
 
 ## Repo layout
 
@@ -205,8 +253,13 @@ src/
       pricing.ts             PricingRepository + calculateCost (+ listEnabledByModelClass)
     routing/
       types.ts               RoutingPolicy, RouteCandidate, RoutingDecision, ProviderHealthOracle
-      health.ts              AlwaysHealthyOracle (Phase 5 circuit breaker plugs in here)
+      health.ts              AlwaysHealthyOracle (circuit breaker plugs in here)
       cost-optimized.ts      CostOptimizedRoutingPolicy
+    budget/
+      repository.ts          UsageLedgerRepository (getCurrentMonthSpend + recordUsage)
+    ratelimit/
+      token-bucket.ts        Single-node TokenBucket (time-injectable for tests)
+      rate-limiter.ts        RateLimiter interface + InMemoryRateLimiter
     resilience/              (placeholder)
     cache/                   (placeholder)
     streaming/               (placeholder)
@@ -222,13 +275,15 @@ db/
   seed-fixtures.ts           Shared seed/test constants (tenants, keys, prices)
   migrations/                drizzle-kit-generated SQL
 tests/
-  setup/db.ts                Test DB bootstrap (auto-create, migrate, seed)
+  setup/db.ts                Test DB bootstrap (auto-create, migrate, seed) + truncateUsageLedger
   health.test.ts
   auth.test.ts
   tenants.test.ts
   providers.test.ts
   chat.test.ts
   routing.test.ts
+  budget.test.ts
+  ratelimit.test.ts
 ```
 
 ## Useful one-liners

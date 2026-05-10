@@ -52,6 +52,28 @@ Locked in so far:
   to the first emitted chunk; after that, `stream-drop` is `retryable:
   false` and we surface a final SSE error event with `partial=true` rather
   than silently retry. Documented as a hard rule, not a default.
+- **Budget is durable state in Postgres; rate-limit counters are runtime
+  state in memory.** The two have different durability requirements: a
+  rate-limit counter that resets on a process restart costs at most one
+  minute of slightly looser limits, but spend that resets is a billing
+  bug. So `usage_ledger` is the source of truth for spend (every read is
+  `SUM(cost_usd) WHERE tenant_id=$1 AND created_at >= start_of_month`)
+  while the per-tenant `TokenBucket` lives in process memory. Cost:
+  Single-node only. Production swaps `InMemoryRateLimiter` for a Redis-
+  backed implementation behind the same `RateLimiter` interface.
+- **Post-call accounting (with a documented overspend race).** The chat
+  handler reads spend, then calls the provider, then writes the ledger
+  row. Under high concurrency for the same tenant, two requests can both
+  observe `spend < budget` and both succeed — slightly overspending the
+  cap. Acceptable for assignment scope; production fix is to atomically
+  insert a "pending" reservation row with the estimated cost before the
+  call, then reconcile to the actual cost after. The existing
+  `usage_ledger` schema already supports compensating rows (it's
+  append-only by design).
+- **Tenant rate-limit *config* still comes from Postgres.** The limiter
+  does not cache `tenants.rate_limit_per_minute`. Every call passes the
+  current value in (lifted from `req.tenant`, set by the auth hook).
+  Reconfiguring a tenant's cap takes effect on the very next request.
 
 More decisions get added as adapters, routing, cache, and streaming land.
 

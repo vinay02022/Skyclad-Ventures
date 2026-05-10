@@ -1,5 +1,6 @@
 import { AnthropicProvider } from "./anthropic-real.js";
 import { MockAnthropicProvider } from "./mock-anthropic.js";
+import type { MockFailureStore } from "./mock-failure-store.js";
 import { MockOpenAIProvider } from "./mock-openai.js";
 import { OpenAIProvider } from "./openai-real.js";
 import { ProviderRegistry } from "./registry.js";
@@ -24,6 +25,14 @@ export interface BuildProviderRegistryOptions {
   fetchImpl?: typeof fetch;
   openaiBaseUrl?: string;
   anthropicBaseUrl?: string;
+  /**
+   * Phase 11: optional shared store for the eval-only admin endpoint
+   * `POST /admin/mock-providers/:provider/failure-mode`. Mock adapters
+   * consult it after checking per-request header injection. In live
+   * mode the real adapters never read it (it's silently unused), so
+   * passing the store unconditionally from app.ts is harmless.
+   */
+  mockFailureStore?: MockFailureStore;
 }
 
 /**
@@ -56,8 +65,8 @@ export function buildProviderRegistry(opts: BuildProviderRegistryOptions): Provi
   const registry = new ProviderRegistry();
 
   if (opts.mode === "mock") {
-    registry.register(new MockOpenAIProvider());
-    registry.register(new MockAnthropicProvider());
+    registry.register(new MockOpenAIProvider(opts.mockFailureStore));
+    registry.register(new MockAnthropicProvider(opts.mockFailureStore));
     opts.logger?.info(
       { mode: "mock", openai: "mock", anthropic: "mock" },
       "provider registry built",
@@ -77,7 +86,7 @@ export function buildProviderRegistry(opts: BuildProviderRegistryOptions): Provi
     );
     openaiResolution = "real";
   } else {
-    registry.register(new MockOpenAIProvider());
+    registry.register(new MockOpenAIProvider(opts.mockFailureStore));
     opts.logger?.warn(
       { provider: "openai" },
       "MOCK_PROVIDERS=false but OPENAI_API_KEY is empty; falling back to MOCK openai adapter",
@@ -95,7 +104,7 @@ export function buildProviderRegistry(opts: BuildProviderRegistryOptions): Provi
     );
     anthropicResolution = "real";
   } else {
-    registry.register(new MockAnthropicProvider());
+    registry.register(new MockAnthropicProvider(opts.mockFailureStore));
     opts.logger?.warn(
       { provider: "anthropic" },
       "MOCK_PROVIDERS=false but ANTHROPIC_API_KEY is empty; falling back to MOCK anthropic adapter",

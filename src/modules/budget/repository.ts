@@ -103,6 +103,32 @@ export class UsageLedgerRepository {
   }
 
   /**
+   * Phase 11: eval-only helper. Wipes every usage_ledger row for one
+   * tenant. Returns the number of rows deleted so the admin endpoint
+   * can echo it back to the operator.
+   *
+   * Why this exists: an evaluator wants to demo "tenant_a exhausts
+   * its budget, gets 402, the gateway resets the ledger, request
+   * succeeds again" in a self-contained script. Without this helper
+   * they'd have to either (a) wait until next month for the budget
+   * gate's UTC-month window to roll over, or (b) drop into psql to
+   * truncate manually. Both are friction.
+   *
+   * Why this is NOT a production endpoint: deleting a tenant's usage
+   * ledger silently moves the budget gate, hides spend from finance,
+   * and breaks audit. In production, monthly rollover is the
+   * authoritative reset; ad-hoc resets would go through a versioned
+   * compensating-row API with an admin justification trail.
+   */
+  async resetTenantUsage(tenantId: string): Promise<number> {
+    const result = await this.db
+      .delete(usageLedger)
+      .where(eq(usageLedger.tenantId, tenantId))
+      .returning({ id: usageLedger.id });
+    return result.length;
+  }
+
+  /**
    * Append-only insert of a usage row. Called after a successful provider
    * response. We never UPDATE a ledger row — corrections go through a new
    * compensating row, which preserves auditability.

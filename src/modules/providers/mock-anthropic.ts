@@ -1,7 +1,12 @@
 import { MockProviderBase } from "./mock-base.js";
+import type { MockFailureStore } from "./mock-failure-store.js";
 
 export class MockAnthropicProvider extends MockProviderBase {
   readonly name = "anthropic";
+
+  constructor(failureStore?: MockFailureStore) {
+    super(failureStore);
+  }
 
   protected defaultModelByClass(): Record<string, string | null> {
     return {

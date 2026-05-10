@@ -69,4 +69,42 @@ export class TenantRepository {
       rateLimitPerMinute: row.rateLimitPerMinute,
     };
   }
+
+  /**
+   * Phase 11: eval-only helper. Updates `monthly_budget_usd` for one
+   * tenant and bumps `updated_at`. Returns the new value, or null if
+   * the tenant_id wasn't found.
+   *
+   * Why this exists: an evaluator wants to demo "tenant_b's $2.00
+   * budget gets exhausted, the gateway responds with 402, the
+   * operator raises the cap and the next request succeeds" without
+   * dropping into psql or waiting for a billing cycle. The auth hook
+   * re-reads the tenant on every request, so a budget change takes
+   * effect on the very next call.
+   *
+   * Why this is NOT a production endpoint: budget changes are a
+   * billing-affecting operation and need a per-operator audit trail,
+   * a justification, an approval workflow, and almost always a
+   * limit (max increase per change, max changes per day) — none of
+   * which are in scope here. The single shared ADMIN_TOKEN gate is
+   * exactly the wrong control surface for that.
+   */
+  async setBudget(
+    tenantId: string,
+    monthlyBudgetUsd: number,
+  ): Promise<{ monthlyBudgetUsd: number } | null> {
+    const updated = await this.db
+      .update(tenants)
+      .set({
+        // numeric column accepts a string; use the same toFixed precision
+        // as the seed script to avoid float drift in stored values.
+        monthlyBudgetUsd: monthlyBudgetUsd.toFixed(4),
+        updatedAt: new Date(),
+      })
+      .where(eq(tenants.id, tenantId))
+      .returning({ monthlyBudgetUsd: tenants.monthlyBudgetUsd });
+    const row = updated[0];
+    if (!row) return null;
+    return { monthlyBudgetUsd: Number(row.monthlyBudgetUsd) };
+  }
 }

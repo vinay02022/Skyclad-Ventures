@@ -26,6 +26,7 @@ import { registry as defaultMetricsRegistry } from "./modules/observability/metr
 import { registerObservabilityRoutes } from "./modules/observability/routes.js";
 import { RequestLogRepository } from "./modules/persistence/request-logs-repo.js";
 import { buildProviderRegistry } from "./modules/providers/factory.js";
+import { MockFailureStore } from "./modules/providers/mock-failure-store.js";
 import { PricingRepository } from "./modules/providers/pricing.js";
 import type { ProviderRegistry } from "./modules/providers/registry.js";
 import { InMemoryRateLimiter, type RateLimiter } from "./modules/ratelimit/rate-limiter.js";
@@ -149,6 +150,11 @@ export async function buildApp({
     //     is set, otherwise falls back to mock with a warning so the
     //     operator can see they're not exercising the upstream they
     //     think they are.
+    // Phase 11: shared, process-local store the eval-only admin
+    // endpoint writes to and the mock providers read from. Always
+    // constructed (cheap, two empty maps); only consulted when a
+    // mock adapter is in play, so live mode is unaffected.
+    const mockFailureStore = new MockFailureStore();
     const baseRegistry =
       providers ??
       buildProviderRegistry({
@@ -159,6 +165,7 @@ export async function buildApp({
           info: (obj, msg) => logger.info(obj, msg),
           warn: (obj, msg) => logger.warn(obj, msg),
         },
+        mockFailureStore,
       });
     const pricingRepo = new PricingRepository(db);
     // Phase 6: every adapter in the registry is wrapped with a
@@ -230,9 +237,18 @@ export async function buildApp({
     // Empty/unset = endpoint not registered, so a misconfigured deploy
     // returns 404 to anyone who probes /admin/* — fail closed.
     if (config.ADMIN_TOKEN) {
-      await registerAdminRoutes(app, {
-        usageLedger: ledgerRepo,
-        adminToken: config.ADMIN_TOKEN,
+      // Wrap in a Fastify plugin context so the admin onRequest hook
+      // (Bearer-token check) is encapsulated to /admin/* routes only —
+      // without this register(), the hook would be installed at the app
+      // root and would also reject POST /v1/chat/completions for normal
+      // tenant traffic.
+      await app.register(async (scope) => {
+        await registerAdminRoutes(scope, {
+          usageLedger: ledgerRepo,
+          tenants: tenantRepo,
+          mockFailureStore,
+          adminToken: config.ADMIN_TOKEN,
+        });
       });
     }
   }

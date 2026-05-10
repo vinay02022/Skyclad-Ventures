@@ -1,6 +1,7 @@
 import { setTimeout as sleep } from "node:timers/promises";
 
 import { ProviderError } from "./errors.js";
+import type { MockFailureStore } from "./mock-failure-store.js";
 import { estimateMessagesTokens, estimateTextTokens } from "./tokens.js";
 import type {
   FailureInjection,
@@ -15,8 +16,23 @@ import type {
 // inherit it. The only things subclasses customize are the provider name,
 // the model-class -> default-model mapping, and the small "vendor flavour"
 // the mock prepends to its reply (so tests can prove which mock answered).
+//
+// Failure injection has two sources, in this priority order:
+//   1. `req.failure` — header-driven, per-request. Wins.
+//   2. `failureStore.get(this.name)` — persistent, set by the eval
+//      admin endpoint. Used when no header was sent.
+// The store is optional so existing tests that build a mock with
+// `new MockOpenAIProvider()` continue to work unchanged.
 export abstract class MockProviderBase implements ProviderAdapter {
   abstract readonly name: string;
+
+  constructor(protected readonly failureStore?: MockFailureStore) {}
+
+  /** Returns the effective failure injection (header > store > none). */
+  protected resolveFailure(req: ProviderChatRequest): FailureInjection | undefined {
+    if (req.failure) return req.failure;
+    return this.failureStore?.get(this.name) ?? undefined;
+  }
 
   /** Default models per class. Subclasses fill this in. */
   protected abstract defaultModelByClass(): Record<string, string | null>;
@@ -29,7 +45,8 @@ export abstract class MockProviderBase implements ProviderAdapter {
   }
 
   async complete(req: ProviderChatRequest): Promise<ProviderChatResponse> {
-    await this.applyPreCallFailure(req.failure);
+    const failure = this.resolveFailure(req);
+    await this.applyPreCallFailure(failure);
 
     const inputTokens = estimateMessagesTokens(req.messages);
     const echoed = req.messages.at(-1)?.content?.slice(0, 80) ?? "";
@@ -44,13 +61,13 @@ export abstract class MockProviderBase implements ProviderAdapter {
   }
 
   async *stream(req: ProviderChatRequest): AsyncIterable<ProviderStreamChunk> {
+    const failure = this.resolveFailure(req);
     // pre-stream-drop is the "drops before any byte" failure mode. The
     // resilience layer is allowed to retry/failover when this happens.
     // Honors targetProvider for the same reason as applyPreCallFailure.
-    const targetMatches =
-      !req.failure?.targetProvider || req.failure.targetProvider === this.name;
-    if (req.failure?.mode === "pre-stream-drop" && targetMatches) {
-      if (req.failure.delayMs) await sleep(req.failure.delayMs);
+    const targetMatches = !failure?.targetProvider || failure.targetProvider === this.name;
+    if (failure?.mode === "pre-stream-drop" && targetMatches) {
+      if (failure.delayMs) await sleep(failure.delayMs);
       throw new ProviderError("mock pre-stream drop", {
         statusCode: 503,
         retryable: true,
@@ -60,7 +77,7 @@ export abstract class MockProviderBase implements ProviderAdapter {
 
     // Non-stream failures (5xx, rate-limit, timeout) still apply before any
     // stream chunk is sent, so they behave like a clean failover.
-    await this.applyPreCallFailure(req.failure);
+    await this.applyPreCallFailure(failure);
 
     const inputTokens = estimateMessagesTokens(req.messages);
     const echoed = req.messages.at(-1)?.content?.slice(0, 80) ?? "";
@@ -71,9 +88,9 @@ export abstract class MockProviderBase implements ProviderAdapter {
     for (let i = 0; i < chunks.length; i++) {
       // mid-stream drop: emit afterChunks chunks then fail.
       if (
-        req.failure?.mode === "stream-drop" &&
-        typeof req.failure.afterChunks === "number" &&
-        i >= req.failure.afterChunks &&
+        failure?.mode === "stream-drop" &&
+        typeof failure.afterChunks === "number" &&
+        i >= failure.afterChunks &&
         targetMatches
       ) {
         throw new ProviderError("mock stream drop", {

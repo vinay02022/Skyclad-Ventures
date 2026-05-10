@@ -16,6 +16,17 @@ const EnvSchema = z.object({
     .default("postgres://gateway:gateway@localhost:5432/gateway"),
   OPENAI_API_KEY: z.string().optional().default(""),
   ANTHROPIC_API_KEY: z.string().optional().default(""),
+  // Provider mode selection. Defaults to mock so a fresh clone, every
+  // test run, and any "I just want to see the gateway move" demo never
+  // accidentally bills a real provider account. Setting to "false"
+  // switches each provider to its real adapter IF the corresponding
+  // API key is present; missing keys fall back to mock per provider
+  // (with a warning) rather than failing boot, so you can run with one
+  // real upstream and one mock upstream while developing.
+  MOCK_PROVIDERS: z
+    .union([z.literal("true"), z.literal("false")])
+    .optional()
+    .default("true"),
   // Admin endpoints (currently just GET /admin/tenants/:id/usage) are gated
   // behind a single bearer token. Empty / unset means the admin surface is
   // not mounted at all, so a misconfigured deploy fails closed: no

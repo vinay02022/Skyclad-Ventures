@@ -140,9 +140,26 @@ export async function buildApp({
     registerAuthHook(app, tenantRepo);
     await registerTenantRoutes(app, tenantRepo);
 
-    // Phase 3: chat completions. Default to the mock-mode registry so a
-    // fresh clone runs end-to-end without OpenAI/Anthropic API keys.
-    const baseRegistry = providers ?? buildProviderRegistry({ mode: "mock" });
+    // Phase 3 / 10: chat completions. Provider registry resolution:
+    //   - Tests / explicit injection: opts.providers wins.
+    //   - MOCK_PROVIDERS=true (default): both providers are mocks. A
+    //     fresh clone, every test run, and any "I just want to see
+    //     the gateway move" demo never bills a real account.
+    //   - MOCK_PROVIDERS=false: each provider goes real if its API key
+    //     is set, otherwise falls back to mock with a warning so the
+    //     operator can see they're not exercising the upstream they
+    //     think they are.
+    const baseRegistry =
+      providers ??
+      buildProviderRegistry({
+        mode: config.MOCK_PROVIDERS === "false" ? "live" : "mock",
+        openaiApiKey: config.OPENAI_API_KEY,
+        anthropicApiKey: config.ANTHROPIC_API_KEY,
+        logger: {
+          info: (obj, msg) => logger.info(obj, msg),
+          warn: (obj, msg) => logger.warn(obj, msg),
+        },
+      });
     const pricingRepo = new PricingRepository(db);
     // Phase 6: every adapter in the registry is wrapped with a
     // ResilientAdapter (timeout + retry + circuit breaker). Wrapping

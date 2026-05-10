@@ -102,6 +102,8 @@ describe("ResilientAdapter retry behaviour", () => {
     const result = await adapter.complete({
       model: "scripted-model",
       messages: [{ role: "user", content: "hi" }],
+      temperature: 0,
+      max_tokens: 100,
     });
 
     expect(result.message.content).toBe("ok");
@@ -118,7 +120,12 @@ describe("ResilientAdapter retry behaviour", () => {
     const adapter = new ResilientAdapter(inner, breaker, config);
 
     await expect(
-      adapter.complete({ model: "scripted-model", messages: [{ role: "user", content: "x" }] }),
+      adapter.complete({
+        model: "scripted-model",
+        messages: [{ role: "user", content: "x" }],
+        temperature: 0,
+        max_tokens: 100,
+      }),
     ).rejects.toMatchObject({ statusCode: 400, retryable: false });
 
     expect(inner.callCount).toBe(1);
@@ -138,7 +145,12 @@ describe("ResilientAdapter retry behaviour", () => {
     const adapter = new ResilientAdapter(inner, breaker, config);
 
     await expect(
-      adapter.complete({ model: "scripted-model", messages: [{ role: "user", content: "x" }] }),
+      adapter.complete({
+        model: "scripted-model",
+        messages: [{ role: "user", content: "x" }],
+        temperature: 0,
+        max_tokens: 100,
+      }),
     ).rejects.toMatchObject({ statusCode: 500, retryable: true });
 
     // maxAttempts=3 -> exactly three calls, three breaker failures recorded.
@@ -181,7 +193,12 @@ describe("ResilientAdapter timeout integration", () => {
     const adapter = new ResilientAdapter(inner, breaker, config);
 
     await expect(
-      adapter.complete({ model: "scripted-model", messages: [{ role: "user", content: "x" }] }),
+      adapter.complete({
+        model: "scripted-model",
+        messages: [{ role: "user", content: "x" }],
+        temperature: 0,
+        max_tokens: 100,
+      }),
     ).rejects.toMatchObject({ statusCode: 504, retryable: true });
     expect(inner.callCount).toBe(3);
   });
@@ -330,6 +347,8 @@ describe("Failover with ResilientAdapter (chat-handler-shaped scenario)", () => 
         const r = await adapter.complete({
           model: "scripted-model",
           messages: [{ role: "user", content: "hi" }],
+          temperature: 0,
+          max_tokens: 100,
         });
         response = { provider: adapter.name };
         void r;
@@ -355,7 +374,12 @@ describe("Failover with ResilientAdapter (chat-handler-shaped scenario)", () => 
     const adapter = new ResilientAdapter(inner, breakerOpen, config);
 
     await expect(
-      adapter.complete({ model: "scripted-model", messages: [{ role: "user", content: "x" }] }),
+      adapter.complete({
+        model: "scripted-model",
+        messages: [{ role: "user", content: "x" }],
+        temperature: 0,
+        max_tokens: 100,
+      }),
     ).rejects.toMatchObject({ statusCode: 503, retryable: true });
 
     // Circuit short-circuited the call; the inner adapter was never invoked.

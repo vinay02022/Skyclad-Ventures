@@ -2,6 +2,7 @@ import {
   boolean,
   index,
   integer,
+  jsonb,
   numeric,
   pgTable,
   text,
@@ -158,6 +159,45 @@ export const requestLogs = pgTable(
   ],
 );
 
+// ---------- cache_entries ----------
+// Deterministic-response cache. Keyed by SHA-256 of (tenant_id, model_class,
+// provider, model, normalized messages, temperature, max_tokens). The hash
+// already encodes tenant_id, but we ALSO scope the row by tenant_id and a
+// composite UNIQUE index on (tenant_id, cache_key). Two layers of isolation:
+// the cryptographic key prevents collisions across tenants, and the SQL
+// unique constraint makes a "leak across tenants" bug a constraint
+// violation, not silent corruption.
+//
+// response_json is the cacheable subset of the unified response (provider,
+// model, message, usage, model_class). On a hit we wrap it with fresh
+// id/created_at/cached:true and a routing block that says "cache" — the
+// request_id and timestamp must reflect the current request, not the
+// cached one.
+//
+// expires_at is checked on every read (gt expires_at, now). We do not run
+// a sweeper for assignment scope; stale rows just sit there, harmless.
+// Production would add a periodic DELETE WHERE expires_at < now() and
+// optionally a TTL index.
+export const cacheEntries = pgTable(
+  "cache_entries",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    cacheKey: text("cache_key").notNull(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    responseJson: jsonb("response_json").notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    // Cross-tenant isolation enforced at the storage layer.
+    uniqueIndex("cache_entries_tenant_key_idx").on(t.tenantId, t.cacheKey),
+    // Lets a future cleanup job pull only the rows it needs.
+    index("cache_entries_expires_idx").on(t.expiresAt),
+  ],
+);
+
 export type Tenant = typeof tenants.$inferSelect;
 export type NewTenant = typeof tenants.$inferInsert;
 export type ApiKey = typeof apiKeys.$inferSelect;
@@ -165,3 +205,4 @@ export type ProviderConfig = typeof providerConfigs.$inferSelect;
 export type TenantProviderAllowlist = typeof tenantProviderAllowlists.$inferSelect;
 export type UsageLedgerEntry = typeof usageLedger.$inferSelect;
 export type RequestLog = typeof requestLogs.$inferSelect;
+export type CacheEntry = typeof cacheEntries.$inferSelect;

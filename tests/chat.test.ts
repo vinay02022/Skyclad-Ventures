@@ -29,6 +29,14 @@ const fastResilienceConfig = {
   breaker: { failureThreshold: 9_999, failureWindowMs: 60_000, openCooldownMs: 1_000 },
 };
 
+// Cache is disabled here for the same reason: chat.test.ts asserts on
+// router/failover behaviour, and many cases reuse identical request
+// bodies. With the cache on, the first test would prime an entry and
+// later tests would never reach the provider (or the failure injection
+// they install). tests/cache.test.ts is the suite that actually
+// exercises cache behaviour.
+const cacheDisabled = { enabled: false, ttlMs: 0 };
+
 beforeAll(async () => {
   if (!dbAvailable) return;
   const config = loadConfig({
@@ -46,6 +54,7 @@ beforeAll(async () => {
     db: handle.db,
     resilience: fastResilienceConfig,
     breakers,
+    cacheConfig: cacheDisabled,
   });
   await app.ready();
 });

@@ -11,9 +11,12 @@ import type { Logger } from "pino";
 import type { Database } from "../db/client.js";
 import type { AppConfig } from "./config.js";
 import { registerAuthHook } from "./modules/auth/hook.js";
+import { UsageLedgerRepository } from "./modules/budget/repository.js";
+import { DEFAULT_CACHE_CONFIG } from "./modules/cache/defaults.js";
+import { CacheRepository } from "./modules/cache/repository.js";
+import type { CacheConfig } from "./modules/cache/types.js";
 import { registerChatRoutes } from "./modules/chat/routes.js";
 import { registerObservabilityRoutes } from "./modules/observability/routes.js";
-import { UsageLedgerRepository } from "./modules/budget/repository.js";
 import { buildProviderRegistry } from "./modules/providers/factory.js";
 import { PricingRepository } from "./modules/providers/pricing.js";
 import type { ProviderRegistry } from "./modules/providers/registry.js";
@@ -54,6 +57,12 @@ export interface BuildAppOptions {
   // 200/500ms backoff + jitter, breaker opens after 5 failures in 60s).
   resilience?: ResilienceConfig;
   breakers?: CircuitBreakerRegistry;
+  // Phase 7: deterministic-response cache. Tests inject their own repo
+  // (with a fake clock) to test TTL expiry without sleeping, and override
+  // ttlMs/enabled to bypass the cache when the test is about something
+  // else. Production uses the default 5-minute TTL.
+  cache?: CacheRepository;
+  cacheConfig?: CacheConfig;
 }
 
 // App builder is separated from the listener so tests can use `app.inject(...)`
@@ -69,6 +78,8 @@ export async function buildApp({
   usageLedger,
   resilience,
   breakers,
+  cache,
+  cacheConfig,
 }: BuildAppOptions): Promise<FastifyInstance> {
   const app = Fastify({
     // Pino's Logger is structurally compatible with FastifyBaseLogger at runtime;
@@ -144,6 +155,12 @@ export async function buildApp({
     // only that tenant.
     const limiter = rateLimiter ?? new InMemoryRateLimiter();
     const ledgerRepo = usageLedger ?? new UsageLedgerRepository(db);
+    // Phase 7: deterministic-response cache, Postgres-backed. The handler
+    // checks it AFTER the routing decision so the cache key reflects the
+    // provider/model the router would have called, and skips both lookup
+    // and write for streaming or temperature > 0.
+    const cacheRepo = cache ?? new CacheRepository(db);
+    const cacheCfg = cacheConfig ?? DEFAULT_CACHE_CONFIG;
     await registerChatRoutes(app, {
       providers: providerRegistry,
       pricing: pricingRepo,
@@ -152,6 +169,8 @@ export async function buildApp({
       health: healthOracle,
       rateLimiter: limiter,
       usageLedger: ledgerRepo,
+      cache: cacheRepo,
+      cacheConfig: cacheCfg,
     });
   }
 

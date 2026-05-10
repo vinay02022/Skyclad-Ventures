@@ -1,6 +1,10 @@
 import type { FastifyInstance, FastifyRequest } from "fastify";
 
 import type { UsageLedgerRepository } from "../budget/repository.js";
+import { buildCacheKey } from "../cache/key.js";
+import { isCacheable } from "../cache/policy.js";
+import type { CacheRepository } from "../cache/repository.js";
+import type { CacheConfig, CachedResponsePayload } from "../cache/types.js";
 import { ProviderError } from "../providers/errors.js";
 import { parseFailureInjection } from "../providers/failure-injection.js";
 import { calculateCost, PricingRepository } from "../providers/pricing.js";
@@ -28,6 +32,8 @@ export interface RegisterChatRoutesDeps {
   health: ProviderHealthOracle;
   rateLimiter: RateLimiter;
   usageLedger: UsageLedgerRepository;
+  cache: CacheRepository;
+  cacheConfig: CacheConfig;
 }
 
 /**
@@ -46,12 +52,20 @@ export interface RegisterChatRoutesDeps {
  *        - body.provider not set   -> ask the routing policy. Policy returns
  *                                     a primary candidate plus an ordered
  *                                     fallback list (cheap -> expensive).
- *   6. Walk candidates in order. On a retryable ProviderError, try the next
+ *   6. Cache lookup (Phase 7): if the request is deterministic and not
+ *      streaming, build a tenant-scoped SHA-256 key over the SELECTED
+ *      provider/model and the normalized request. On hit, return the
+ *      cached response with cached:true, cost_usd:0, no provider call,
+ *      no usage_ledger write. On miss, fall through to the failover loop.
+ *   7. Walk candidates in order. On a retryable ProviderError, try the next
  *      one. On a non-retryable error, bail with 502. Stop on first success.
- *   7. Append a usage_ledger row reflecting the actual cost charged
+ *   8. Append a usage_ledger row reflecting the actual cost charged
  *      (post-success accounting; see DESIGN.md for the documented race
  *      under high concurrency).
- *   8. Normalize and respond.
+ *   9. Cache write: if the request was cacheable, store the successful
+ *      response keyed by the provider that ACTUALLY answered (which may
+ *      not be the originally selected one if a fallback ran).
+ *  10. Normalize and respond.
  *
  * Streaming still returns 501 — SSE lands in a later phase.
  */
@@ -204,7 +218,66 @@ export async function registerChatRoutes(
       candidatesConsidered = decision.candidates_considered;
     }
 
-    // ---- 3. Failover loop --------------------------------------------
+    // ---- 5. Cache lookup --------------------------------------------
+    // Cache is consulted AFTER routing so the key reflects the provider
+    // the router would call right now. If the router picked anthropic
+    // because openai's breaker is OPEN, we won't accidentally serve
+    // openai's old answer.
+    //
+    // Eligibility: non-streaming AND temperature == 0 (the default).
+    // Anything else bypasses the cache entirely — neither read nor write.
+    const cacheable = deps.cacheConfig.enabled && isCacheable(body);
+    const selected = order[0]!;
+    const cacheKey = cacheable
+      ? buildCacheKey({
+          tenantId: tenant.id,
+          modelClass: body.model_class,
+          provider: selected.provider,
+          model: selected.model,
+          messages: body.messages,
+          temperature: body.temperature,
+          maxTokens: body.max_tokens,
+        })
+      : null;
+
+    if (cacheable && cacheKey) {
+      const hit = await deps.cache.get(tenant.id, cacheKey);
+      if (hit) {
+        const cachedResponse: UnifiedChatResponse = {
+          id: req.id,
+          model_class: hit.model_class,
+          provider: hit.provider,
+          model: hit.model,
+          message: hit.message,
+          usage: hit.usage,
+          // Assignment rule: cache hits do not bill the tenant.
+          cost_usd: 0,
+          cached: true,
+          created_at: new Date().toISOString(),
+          routing: {
+            policy: "cache",
+            candidate_count: 0,
+            fallback_used: false,
+            reason: "cache_hit",
+          },
+        };
+        req.log.info(
+          {
+            tenant_id: tenant.id,
+            cache_hit: true,
+            cache_key: cacheKey,
+            provider: hit.provider,
+            model: hit.model,
+            input_tokens: hit.usage.input_tokens,
+            output_tokens: hit.usage.output_tokens,
+          },
+          "chat completion ok (cache hit)",
+        );
+        return cachedResponse;
+      }
+    }
+
+    // ---- 6. Failover loop --------------------------------------------
     const failure = parseFailureInjection(req.headers);
     const errors: { provider: string; status: number; message: string }[] = [];
 
@@ -297,6 +370,52 @@ export async function registerChatRoutes(
           );
         }
 
+        // Cache write. Key by the provider that ACTUALLY answered, not
+        // the one the router originally picked, so a future identical
+        // request that the router routes the same way hits the cache.
+        // We deliberately do NOT block the response on cache write
+        // failure — caching is an optimization, not part of the
+        // request's correctness contract.
+        if (cacheable) {
+          const writeKey =
+            adapter.name === selected.provider && result.model === selected.model
+              ? cacheKey!
+              : buildCacheKey({
+                  tenantId: tenant.id,
+                  modelClass: body.model_class,
+                  provider: adapter.name,
+                  model: result.model,
+                  messages: body.messages,
+                  temperature: body.temperature,
+                  maxTokens: body.max_tokens,
+                });
+          const payload: CachedResponsePayload = {
+            model_class: body.model_class,
+            provider: adapter.name,
+            model: result.model,
+            message: result.message,
+            usage: response.usage,
+          };
+          try {
+            await deps.cache.set({
+              tenantId: tenant.id,
+              cacheKey: writeKey,
+              payload,
+              ttlMs: deps.cacheConfig.ttlMs,
+            });
+          } catch (cacheErr) {
+            req.log.warn(
+              {
+                err: cacheErr,
+                tenant_id: tenant.id,
+                provider: adapter.name,
+                model: result.model,
+              },
+              "cache write failed; response served, future identical requests will miss",
+            );
+          }
+        }
+
         req.log.info(
           {
             tenant_id: tenant.id,
@@ -311,6 +430,7 @@ export async function registerChatRoutes(
             input_tokens: response.usage.input_tokens,
             output_tokens: response.usage.output_tokens,
             cost_usd: costUsd,
+            cache_hit: false,
           },
           "chat completion ok",
         );

@@ -82,6 +82,7 @@ async function ensureTestDatabaseExists(connectionString: string): Promise<void>
 async function truncateAll(handle: DbHandle): Promise<void> {
   await handle.pool.query(`
     TRUNCATE TABLE
+      cache_entries,
       usage_ledger,
       request_logs,
       tenant_provider_allowlists,
@@ -99,4 +100,12 @@ async function truncateAll(handle: DbHandle): Promise<void> {
  */
 export async function truncateUsageLedger(handle: DbHandle): Promise<void> {
   await handle.pool.query("TRUNCATE TABLE usage_ledger RESTART IDENTITY");
+}
+
+/**
+ * Truncate just the cache_entries. Cache tests use this in beforeEach so
+ * each scenario starts cold without paying to re-seed tenants/providers.
+ */
+export async function truncateCacheEntries(handle: DbHandle): Promise<void> {
+  await handle.pool.query("TRUNCATE TABLE cache_entries RESTART IDENTITY");
 }

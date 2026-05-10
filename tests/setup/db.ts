@@ -91,3 +91,12 @@ async function truncateAll(handle: DbHandle): Promise<void> {
     RESTART IDENTITY CASCADE
   `);
 }
+
+/**
+ * Truncate just the usage_ledger. Tests for budget enforcement use this
+ * in beforeEach so each scenario starts from a known $0 spend without
+ * tearing down tenants and provider_configs (which are expensive to reseed).
+ */
+export async function truncateUsageLedger(handle: DbHandle): Promise<void> {
+  await handle.pool.query("TRUNCATE TABLE usage_ledger RESTART IDENTITY");
+}

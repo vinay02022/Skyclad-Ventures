@@ -1,5 +1,6 @@
 import type { FastifyInstance, FastifyRequest } from "fastify";
 
+import type { UsageLedgerRepository } from "../budget/repository.js";
 import { ProviderError } from "../providers/errors.js";
 import { parseFailureInjection } from "../providers/failure-injection.js";
 import { calculateCost, PricingRepository } from "../providers/pricing.js";
@@ -9,6 +10,7 @@ import type {
   ProviderChatRequest,
   UnifiedChatResponse,
 } from "../providers/types.js";
+import type { RateLimiter } from "../ratelimit/rate-limiter.js";
 import type {
   ProviderHealthOracle,
   RouteCandidate,
@@ -24,22 +26,32 @@ export interface RegisterChatRoutesDeps {
   tenants: TenantRepository;
   policy: RoutingPolicy;
   health: ProviderHealthOracle;
+  rateLimiter: RateLimiter;
+  usageLedger: UsageLedgerRepository;
 }
 
 /**
- * The single chat endpoint. Phase 4 reshapes the body of this handler:
+ * The single chat endpoint. Flow:
  *
  *   1. Auth (already done by the auth hook; we re-check defensively).
  *   2. Validate the body via Zod.
- *   3. Resolve a routing decision:
+ *   3. Rate-limit gate (Phase 5): in-memory token bucket per tenant. Sized
+ *      from `tenants.rate_limit_per_minute`. 429 if exhausted.
+ *   4. Budget gate (Phase 5): SUM(cost_usd) over current month from
+ *      usage_ledger (the source of truth). 402 if at or above
+ *      `tenants.monthly_budget_usd`.
+ *   5. Resolve a routing decision:
  *        - body.provider set       -> debug override path: caller pins one
  *                                     provider, no failover.
  *        - body.provider not set   -> ask the routing policy. Policy returns
  *                                     a primary candidate plus an ordered
  *                                     fallback list (cheap -> expensive).
- *   4. Walk candidates in order. On a retryable ProviderError, try the next
+ *   6. Walk candidates in order. On a retryable ProviderError, try the next
  *      one. On a non-retryable error, bail with 502. Stop on first success.
- *   5. Normalize and respond.
+ *   7. Append a usage_ledger row reflecting the actual cost charged
+ *      (post-success accounting; see DESIGN.md for the documented race
+ *      under high concurrency).
+ *   8. Normalize and respond.
  *
  * Streaming still returns 501 — SSE lands in a later phase.
  */
@@ -79,7 +91,61 @@ export async function registerChatRoutes(
       });
     }
 
-    // ---- 2. Resolve the route ----------------------------------------
+    // ---- 2. Rate-limit gate ------------------------------------------
+    // Cheapest reject path: a single in-memory map lookup + arithmetic. No
+    // I/O. Sized from tenants.rate_limit_per_minute, which the auth hook
+    // already loaded onto req.tenant from Postgres. Per-tenant bucket; one
+    // tenant's burst cannot drain another's.
+    const rate = deps.rateLimiter.checkPerMinute(tenant.id, tenant.rateLimitPerMinute);
+    if (!rate.allowed) {
+      const retryAfterSec = Math.max(1, Math.ceil(rate.retryAfterMs / 1000));
+      reply.header("Retry-After", retryAfterSec.toString());
+      reply.header("X-RateLimit-Limit", rate.capacity.toString());
+      reply.header("X-RateLimit-Remaining", "0");
+      req.log.warn(
+        {
+          tenant_id: tenant.id,
+          rate_limit_per_minute: rate.capacity,
+          retry_after_ms: rate.retryAfterMs,
+        },
+        "tenant rate limited",
+      );
+      return reply.code(429).send({
+        error: "TENANT_RATE_LIMITED",
+        message: `Rate limit of ${rate.capacity} req/min exceeded for this tenant.`,
+        retry_after_ms: rate.retryAfterMs,
+        request_id: req.id,
+      });
+    }
+    reply.header("X-RateLimit-Limit", rate.capacity.toString());
+    reply.header("X-RateLimit-Remaining", Math.floor(rate.remaining).toString());
+
+    // ---- 3. Budget gate ----------------------------------------------
+    // SUM over usage_ledger (the source of truth) for the current calendar
+    // month. Documented race: between this read and the post-call ledger
+    // write, concurrent requests for the same tenant can each see "spend <
+    // budget" and slightly overspend. Acceptable for the assignment scope;
+    // production would reserve estimated cost atomically before the call.
+    const monthSpend = await deps.usageLedger.getCurrentMonthSpend(tenant.id);
+    if (monthSpend >= tenant.monthlyBudgetUsd) {
+      req.log.warn(
+        {
+          tenant_id: tenant.id,
+          spent_usd: monthSpend,
+          budget_usd: tenant.monthlyBudgetUsd,
+        },
+        "tenant budget exceeded",
+      );
+      return reply.code(402).send({
+        error: "TENANT_BUDGET_EXCEEDED",
+        message: `Tenant has spent $${monthSpend.toFixed(4)} of $${tenant.monthlyBudgetUsd.toFixed(2)} monthly budget.`,
+        spent_usd: Number(monthSpend.toFixed(6)),
+        budget_usd: tenant.monthlyBudgetUsd,
+        request_id: req.id,
+      });
+    }
+
+    // ---- 4. Resolve the route ----------------------------------------
     const allowlist = await deps.tenants.getAllowlist(tenant.id);
 
     let order: RouteCandidate[];
@@ -202,6 +268,34 @@ export async function registerChatRoutes(
             reason: candidate.reason,
           },
         };
+
+        // Append to usage_ledger BEFORE responding so the next request from
+        // this tenant sees the updated spend. We treat a ledger write
+        // failure as non-fatal for the caller (they got their answer); it
+        // is logged loudly so accounting drift is visible. See DESIGN.md
+        // for why this is a deliberate trade for assignment scope.
+        try {
+          await deps.usageLedger.recordUsage({
+            tenantId: tenant.id,
+            provider: adapter.name,
+            model: result.model,
+            requestId: req.id,
+            inputTokens: response.usage.input_tokens,
+            outputTokens: response.usage.output_tokens,
+            costUsd: costUsd,
+          });
+        } catch (ledgerErr) {
+          req.log.error(
+            {
+              err: ledgerErr,
+              tenant_id: tenant.id,
+              provider: adapter.name,
+              model: result.model,
+              cost_usd: costUsd,
+            },
+            "usage_ledger write failed; tenant spend not recorded for this request",
+          );
+        }
 
         req.log.info(
           {

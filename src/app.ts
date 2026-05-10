@@ -13,9 +13,11 @@ import type { AppConfig } from "./config.js";
 import { registerAuthHook } from "./modules/auth/hook.js";
 import { registerChatRoutes } from "./modules/chat/routes.js";
 import { registerObservabilityRoutes } from "./modules/observability/routes.js";
+import { UsageLedgerRepository } from "./modules/budget/repository.js";
 import { buildProviderRegistry } from "./modules/providers/factory.js";
 import { PricingRepository } from "./modules/providers/pricing.js";
 import type { ProviderRegistry } from "./modules/providers/registry.js";
+import { InMemoryRateLimiter, type RateLimiter } from "./modules/ratelimit/rate-limiter.js";
 import { CostOptimizedRoutingPolicy } from "./modules/routing/cost-optimized.js";
 import { AlwaysHealthyOracle } from "./modules/routing/health.js";
 import type { ProviderHealthOracle, RoutingPolicy } from "./modules/routing/types.js";
@@ -36,6 +38,11 @@ export interface BuildAppOptions {
   // oracle. Defaults below are good for local + assignment scope.
   policy?: RoutingPolicy;
   health?: ProviderHealthOracle;
+  // Tests inject their own to call .reset() between cases. Production lets
+  // buildApp construct a fresh single-node InMemoryRateLimiter.
+  rateLimiter?: RateLimiter;
+  // Tests inject to read ledger writes back. Production constructs from db.
+  usageLedger?: UsageLedgerRepository;
 }
 
 // App builder is separated from the listener so tests can use `app.inject(...)`
@@ -47,6 +54,8 @@ export async function buildApp({
   providers,
   policy,
   health,
+  rateLimiter,
+  usageLedger,
 }: BuildAppOptions): Promise<FastifyInstance> {
   const app = Fastify({
     // Pino's Logger is structurally compatible with FastifyBaseLogger at runtime;
@@ -94,16 +103,23 @@ export async function buildApp({
     const providerRegistry = providers ?? buildProviderRegistry({ mode: "mock" });
     const pricingRepo = new PricingRepository(db);
     // Phase 4: route by cost across the tenant allowlist + provider health.
-    // AlwaysHealthyOracle is a placeholder until Phase 5's circuit breaker
-    // lands; the routing seam stays the same.
+    // AlwaysHealthyOracle is the default until a circuit breaker lands; the
+    // routing seam stays the same.
     const routingPolicy = policy ?? new CostOptimizedRoutingPolicy();
     const healthOracle = health ?? new AlwaysHealthyOracle();
+    // Phase 5: per-tenant rate limit (in-memory) + budget ledger (Postgres).
+    // Both are isolated per tenant_id; a tenant exhausting either rejects
+    // only that tenant.
+    const limiter = rateLimiter ?? new InMemoryRateLimiter();
+    const ledgerRepo = usageLedger ?? new UsageLedgerRepository(db);
     await registerChatRoutes(app, {
       providers: providerRegistry,
       pricing: pricingRepo,
       tenants: tenantRepo,
       policy: routingPolicy,
       health: healthOracle,
+      rateLimiter: limiter,
+      usageLedger: ledgerRepo,
     });
   }
 
